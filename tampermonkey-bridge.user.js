@@ -31,7 +31,9 @@
     var handState = {
         handId: null,
         activeSeats: {},
-        activeCount: null
+        activeCount: null,
+        boardCount: 0,
+        holeSentForHand: false
     };
 
     function currentBridgeUrl() {
@@ -261,6 +263,8 @@
             handState.handId = handId;
             handState.activeSeats = {};
             handState.activeCount = null;
+            handState.boardCount = 0;
+            handState.holeSentForHand = false;
         }
 
         var next = {};
@@ -301,6 +305,8 @@
             handState.handId = handId;
             handState.activeSeats = {};
             handState.activeCount = null;
+            handState.boardCount = 0;
+            handState.holeSentForHand = false;
         }
 
         if (!Object.prototype.hasOwnProperty.call(handState.activeSeats, seatId)) {
@@ -349,6 +355,33 @@
         return Math.max(2, Math.min(10, active));
     }
 
+    function maybeHolePayloadFromPlayerObject(value, playersCount) {
+        if (!value || typeof value !== 'object') {
+            return null;
+        }
+        if (handState.holeSentForHand || handState.boardCount > 0) {
+            return null;
+        }
+        if (!Object.prototype.hasOwnProperty.call(value, 'cards')) {
+            return null;
+        }
+        if (!Object.prototype.hasOwnProperty.call(value, 'seatId') && !Object.prototype.hasOwnProperty.call(value, 'userId')) {
+            return null;
+        }
+
+        var cards = extractCardsFromValue(value.cards, 2);
+        if (!cards || cards.length !== 2) {
+            return null;
+        }
+
+        handState.holeSentForHand = true;
+        var payload = { type: 'poker_cards', hole: cards };
+        if (playersCount !== null) {
+            payload.players = playersCount;
+        }
+        return payload;
+    }
+
     function extractCardsFromValue(value, maxCount) {
         if (Array.isArray(value)) {
             var normalizedArray = normalizeCardArray(value, maxCount);
@@ -386,10 +419,6 @@
         seen.push(value);
 
         if (Array.isArray(value)) {
-            var directCards = extractCardsFromValue(value, kindHint === 'hole' ? 2 : 5);
-            if (directCards && directCards.length >= (kindHint === 'hole' ? 2 : 3)) {
-                return kindHint === 'hole' ? { type: 'poker_cards', hole: directCards.slice(0, 2) } : { type: 'poker_cards', board: directCards.slice(0, 5) };
-            }
             for (var i = 0; i < value.length; i += 1) {
                 var child = walkForPayload(value[i], seen, kindHint);
                 if (child) {
@@ -413,11 +442,18 @@
                     handState.activeSeats = {};
                     handState.activeCount = null;
                 }
+                handState.boardCount = 0;
+                handState.holeSentForHand = false;
                 var startPayload = { type: 'poker_cards', reset: true, board: [] };
                 if (playersCount !== null) {
                     startPayload.players = playersCount;
                 }
                 return startPayload;
+            }
+
+            if (action === 'resetTable' || action === 'finishHand') {
+                handState.boardCount = 0;
+                handState.holeSentForHand = false;
             }
 
             if (action === 'fold') {
@@ -430,6 +466,7 @@
             if (action === 'dealCommunityCards') {
                 var boardCards = extractCardsFromValue(value.cards, 5);
                 if (boardCards && boardCards.length >= 1) {
+                    handState.boardCount = Math.min(5, handState.boardCount + boardCards.length);
                     var boardPayload = { type: 'poker_cards', board: boardCards.slice(0, 5) };
                     if (playersCount !== null) {
                         boardPayload.players = playersCount;
@@ -440,6 +477,7 @@
             if (action === 'dealHoleCards') {
                 var holeCards = extractCardsFromValue(value.cards, 2);
                 if (holeCards && holeCards.length === 2) {
+                    handState.holeSentForHand = true;
                     var holePayload = { type: 'poker_cards', hole: holeCards };
                     if (playersCount !== null) {
                         holePayload.players = playersCount;
@@ -447,18 +485,23 @@
                     return holePayload;
                 }
                 if (Array.isArray(value.players)) {
+                    var visibleHands = [];
                     for (var p = 0; p < value.players.length; p += 1) {
                         var player = value.players[p];
                         if (player && Array.isArray(player.cards)) {
                             var playerCards = extractCardsFromValue(player.cards, 2);
                             if (playerCards && playerCards.length === 2) {
-                                var playerHolePayload = { type: 'poker_cards', hole: playerCards };
-                                if (playersCount !== null) {
-                                    playerHolePayload.players = playersCount;
-                                }
-                                return playerHolePayload;
+                                visibleHands.push(playerCards);
                             }
                         }
+                    }
+                    if (visibleHands.length === 1) {
+                        handState.holeSentForHand = true;
+                        var playerHolePayload = { type: 'poker_cards', hole: visibleHands[0] };
+                        if (playersCount !== null) {
+                            playerHolePayload.players = playersCount;
+                        }
+                        return playerHolePayload;
                     }
                 }
             }
@@ -468,29 +511,9 @@
             }
         }
 
-        if (Object.prototype.hasOwnProperty.call(value, 'cards')) {
-            var cards = extractCardsFromValue(value.cards, 5);
-            if (cards && cards.length === 2) {
-                var cardsHolePayload = { type: 'poker_cards', hole: cards };
-                var cardsPlayers = extractPlayersCount(value.players);
-                if (cardsPlayers !== null) {
-                    cardsHolePayload.players = cardsPlayers;
-                }
-                return cardsHolePayload;
-            }
-            if (cards && cards.length >= 3) {
-                var cardsBoardPayload = { type: 'poker_cards', board: cards.slice(0, 5) };
-                var boardPlayers = extractPlayersCount(value.players);
-                if (boardPlayers !== null) {
-                    cardsBoardPayload.players = boardPlayers;
-                }
-                return cardsBoardPayload;
-            }
-        }
-
-        var onlyPlayers = isLikelyFullSnapshot(value.players, '') ? extractPlayersCount(value.players) : null;
-        if (onlyPlayers !== null) {
-            return { type: 'poker_cards', players: onlyPlayers };
+        var playerHolePayloadFromObject = maybeHolePayloadFromPlayerObject(value, handState.activeCount);
+        if (playerHolePayloadFromObject) {
+            return playerHolePayloadFromObject;
         }
 
         var keys = Object.keys(value);
@@ -507,15 +530,7 @@
     function payloadFromArgs(args) {
         for (var i = 0; i < args.length; i += 1) {
             var arg = args[i];
-            if (typeof arg === 'string') {
-                var textCards = extractCardsFromValue(arg, 5);
-                if (textCards && textCards.length === 2) {
-                    return { type: 'poker_cards', hole: textCards };
-                }
-                if (textCards && textCards.length >= 3) {
-                    return { type: 'poker_cards', board: textCards.slice(0, 5) };
-                }
-            } else if (arg && typeof arg === 'object') {
+            if (arg && typeof arg === 'object') {
                 var objectPayload = walkForPayload(arg, [], null);
                 if (objectPayload) {
                     return objectPayload;
