@@ -50,6 +50,9 @@ browser-console.log
 # Jupyter
 .ipynb_checkpoints/
 
+# Idk
+*:Zone.Identifier
+
 # Scripts
 commit.sh
 
