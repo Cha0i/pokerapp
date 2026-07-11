@@ -387,7 +387,7 @@ class PreflopApp(tk.Tk):
             highlightthickness=0,
             bd=0,
             cursor="hand2",
-        ).grid(row=0, column=1, padx=(6, 0), sticky="w")
+        ).grid(row=1, column=0, pady=(6, 0), sticky="w")
 
         self.server_log_widget = tk.Text(
             frame,
@@ -952,6 +952,8 @@ class PreflopApp(tk.Tk):
         pot_odds = (to_call / (pot + to_call)) if (to_call > 0 and pot + to_call > 0) else None
         board_count = sum(1 for card in self.board_cards.values() if card is not None)
         board_codes = [card.code for card in self.board_cards.values() if card is not None]
+        made_hand = describe_current_hand([self.selected[0].code, self.selected[1].code], board_codes) if board_count >= 3 else None
+        made_hand_lower = made_hand.lower() if isinstance(made_hand, str) else ""
         paired_board = len(board_codes) != len({code[0] for code in board_codes}) if board_codes else False
         suit_counts: dict[str, int] = {}
         for code in board_codes:
@@ -969,15 +971,15 @@ class PreflopApp(tk.Tk):
         if self._street == "preflop":
             if preflop_allin_pressure and to_call > 0:
                 if preflop.score >= 82:
-                    headline = "PREMIUM VS JAM. CALL OR RE-JAM."
+                    headline = "PREFLOP SHOVE DETECTED. CALL OR RE-JAM."
                     details.append("This is strong enough to continue against most all-in ranges.")
                 elif equity is not None and pot_odds is not None and equity >= pot_odds + 0.08 and preflop.score >= 65:
-                    headline = "PRICE IS GOOD. CALL CAREFULLY."
+                    headline = "PREFLOP SHOVE DETECTED. CALL CAREFULLY."
                     details.append(
                         f"Exploitative call: equity about {self._format_percent(equity)} vs required {self._format_percent(pot_odds)}."
                     )
                 else:
-                    headline = "THEY JAMMED. K6-TYPE HANDS FOLD."
+                    headline = "PREFLOP SHOVE DETECTED. FOLD MOST MARGINAL HANDS."
                     if equity is not None and pot_odds is not None:
                         details.append(
                             f"Do not punt: equity about {self._format_percent(equity)} vs required {self._format_percent(pot_odds)}."
@@ -1000,11 +1002,19 @@ class PreflopApp(tk.Tk):
                 headline = "SHIT HAND. FOLD."
                 details.append("Trash is trash. Do not invent reasons to continue just because nobody has shown strength yet.")
         else:
-            if equity is not None and equity >= 0.75:
+            if board_count == 5 and to_call > 0 and made_hand_lower.endswith("high"):
+                headline = "RIVER AIR. FOLD."
+                if made_hand:
+                    details.append(f"Your made hand is only {made_hand.lower()}. Do not pay off with air just because the price looks close.")
+            elif board_count == 5 and to_call == 0 and made_hand_lower.endswith("high"):
+                headline = "RIVER AIR. CHECK."
+                if made_hand:
+                    details.append(f"Your made hand is only {made_hand.lower()}. Take the free card/showdown instead of forcing action.")
+            elif equity is not None and equity >= 0.75:
                 headline = "MONSTER HAND. BET BIG."
                 details.append("You are way ahead of one-pair nonsense. Stop trapping and start charging.")
             elif equity is not None and equity >= 0.55 and aggression == "Low":
-                headline = "YOU'RE AHEAD. CHECK OR BET SMALL."
+                headline = "STRONG HAND. CHECK OR BET SMALL."
                 details.append("Nobody seems to have much. Overbetting just folds out worse hands, so keep them in with a small size.")
             elif equity is not None and equity >= 0.55:
                 headline = "VALUE HAND. BET SMALL TO MEDIUM."
@@ -1028,7 +1038,7 @@ class PreflopApp(tk.Tk):
                         f"Math is on your side: equity about {self._format_percent(equity)} vs pot odds about {self._format_percent(pot_odds)}."
                     )
                 elif equity >= pot_odds and to_call > 0:
-                    headline = "CALL IS FINE. DON'T GET FANCY."
+                    headline = "PRICE IS OKAY. CALL ONLY WITH REAL SHOWDOWN VALUE."
                     details.append(
                         f"You are getting roughly the right price: equity about {self._format_percent(equity)}."
                     )
@@ -1105,6 +1115,8 @@ class PreflopApp(tk.Tk):
             self._strategy_players_count = None
             self._recent_actions = []
 
+        board_count = sum(1 for card in self.board_cards.values() if card is not None)
+
         if hole_cards:
             for code in hole_cards[:2]:
                 card = self._card_from_code(code)
@@ -1120,10 +1132,9 @@ class PreflopApp(tk.Tk):
 
             incoming_hole_codes = [card.code for card in parsed_hole]
             existing_hole_codes = [card.code for card in self.selected]
-            board_count = sum(1 for card in self.board_cards.values() if card is not None)
 
             # Keep hole cards immutable within a hand to prevent noisy payload overwrites.
-            if board_count > 0:
+            if board_count > 0 and len(existing_hole_codes) == 2:
                 self._append_server_log("[bridge] ignored hole update after board started")
                 self._log_app_action(
                     "apply_external_cards_skip",
@@ -1157,22 +1168,6 @@ class PreflopApp(tk.Tk):
             self._awaiting_hero_hole_after_reset = False
         hole_changed = bool(parsed_hole) and [card.code for card in self.selected] != previous_hole_codes
 
-        # If a hand reset happened but no hero hole was received yet, ignore board-only updates.
-        if (
-            board_cards is not None
-            and len(parsed_hole) == 0
-            and len(self.selected) == 0
-            and self._awaiting_hero_hole_after_reset
-        ):
-            self._append_server_log("[bridge] waiting for hero hole cards; ignored board update")
-            self.server_info_var.set("Waiting for hero hole cards from bridge...")
-            self._log_app_action(
-                "apply_external_cards_skip",
-                reason="board_before_hero_hole",
-                board_cards=board_cards,
-            )
-            return
-
         if board_cards is not None:
             if len(parsed_board) == 0:
                 for slot in BOARD_ORDER:
@@ -1180,7 +1175,8 @@ class PreflopApp(tk.Tk):
 
             existing_board_cards = [self.board_cards[slot] for slot in BOARD_ORDER if self.board_cards[slot] is not None]
 
-            if hole_changed:
+            late_hole_received = bool(parsed_hole) and board_count > 0 and len(previous_hole_codes) == 0
+            if hole_changed and not late_hole_received:
                 for slot in BOARD_ORDER:
                     self.board_cards[slot] = None
                 existing_board_cards = []

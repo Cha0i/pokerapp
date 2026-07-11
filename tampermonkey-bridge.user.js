@@ -567,6 +567,12 @@
                     }
                 }
             }
+                if (action === 'show' || action === 'showdown' || action === 'awardPot' || action === 'finishHand') {
+                    if (playersCount !== null) {
+                        return { type: 'poker_cards', players: playersCount };
+                    }
+                    return null;
+                }
 
             if (playersCount !== null) {
                 return { type: 'poker_cards', players: playersCount };
