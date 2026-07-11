@@ -55,3 +55,5 @@ commit.sh
 
 # logs
 app-actions.log
+browser-console.log
+strategy-training.log

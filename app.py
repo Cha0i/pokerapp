@@ -81,7 +81,7 @@ class PreflopApp(tk.Tk):
         super().__init__()
         self._use_custom_chrome = True
         self.title("Poker Hand Trainers by Cha0i")
-        self.geometry("1140x1860")
+        self.geometry("838x1563")
         self.minsize(560, 520)
         self.resizable(True, True)
         self.configure(bg=BG_MAIN, highlightthickness=0, bd=0)
@@ -481,6 +481,8 @@ class PreflopApp(tk.Tk):
             return "bet"
         if "RAISE" in headline or "RE-JAM" in headline or "JAM" in headline:
             return "raise"
+        if "OPEN" in headline:
+            return "raise"
         if "CHECK" in headline:
             return "check"
         if "WAIT" in headline:
@@ -789,6 +791,11 @@ class PreflopApp(tk.Tk):
             update_hand_id = update.get("id")
             if isinstance(update_hand_id, int):
                 self._current_hand_id = update_hand_id
+            self.selected = []
+            for slot in BOARD_ORDER:
+                self.board_cards[slot] = None
+            self.active_board_slot = None
+            self._awaiting_hero_hole_after_reset = True
             self._street = "preflop"
             self._pot_chips = None
             self._to_call_chips = None
@@ -996,11 +1003,11 @@ class PreflopApp(tk.Tk):
                     headline = "MARGINAL HAND. USUALLY FOLD."
                     details.append("This is exactly the kind of hand people convince themselves to peel with and regret later.")
                 else:
-                    headline = "PLAYABLE HAND. OPEN SMALL OR FOLD."
-                    details.append("Fine to steal with late or short-handed, but do not build a dumb pot from early position.")
+                    headline = "PLAYABLE HAND. OPEN SMALL."
+                    details.append("If you are first in, make a small open. Do not bloat the pot with junk from bad position.")
             else:
-                headline = "SHIT HAND. FOLD."
-                details.append("Trash is trash. Do not invent reasons to continue just because nobody has shown strength yet.")
+                headline = "TRASH HAND. FOLD."
+                details.append("Without a real steal spot, this is not worth opening.")
         else:
             if board_count == 5 and to_call > 0 and made_hand_lower.endswith("high"):
                 headline = "RIVER AIR. FOLD."
@@ -1019,6 +1026,14 @@ class PreflopApp(tk.Tk):
             elif equity is not None and equity >= 0.55:
                 headline = "VALUE HAND. BET SMALL TO MEDIUM."
                 details.append("You are probably good, but the action says this is not a spot to torch stacks with one pair.")
+
+            if board_count == 5 and to_call == 0 and equity is not None:
+                if equity >= 0.7:
+                    headline = "VALUE HAND. BET SMALL TO MEDIUM."
+                    details.append("You have a real river value spot. Bet small to get paid by worse one-pair hands and bluff-catchers.")
+                elif equity >= 0.5:
+                    headline = "SHOWDOWN VALUE. BET SMALL OR CHECK."
+                    details.append("Thin river value is available, but keep sizes honest and do not force a huge pot.")
 
             if pot_odds is not None and equity is not None:
                 if equity < pot_odds - 0.08 and to_call > 0:
@@ -1052,7 +1067,7 @@ class PreflopApp(tk.Tk):
                 headline = "NOT MUCH THERE. CHECK."
                 details.append("No reason to torch chips with weak showdown value into a developed board.")
 
-            if weak_action and equity is not None and equity >= 0.45 and headline not in {"MONSTER HAND. BET BIG.", "VALUE HAND. BET SMALL TO MEDIUM.", "YOU'RE AHEAD. CHECK OR BET SMALL."}:
+            if weak_action and board_count < 5 and equity is not None and equity >= 0.45 and headline not in {"MONSTER HAND. BET BIG.", "VALUE HAND. BET SMALL TO MEDIUM.", "YOU'RE AHEAD. CHECK OR BET SMALL."}:
                 headline = "NOBODY SEEMS TO HAVE SHIT. STAB SMALL OR CHECK."
                 details.append("This line looks capped. A small stab works often, but checking back is fine if your hand has showdown value.")
 
