@@ -33,7 +33,8 @@
         activeSeats: {},
         activeCount: null,
         boardCount: 0,
-        holeSentForHand: false
+        holeSentForHand: false,
+        heroUserId: null
     };
 
     function currentBridgeUrl() {
@@ -242,6 +243,34 @@
         return action === 'startHand' || action === 'dealHoleCards' || action === 'blinds' || action === 'call' || action === 'bet' || action === 'raise' || action === 'allIn' || action === 'check' || action === 'finishHand' || action === 'resetTable';
     }
 
+    function normalizeUserId(value) {
+        if (typeof value === 'number' && isFinite(value)) {
+            return String(value);
+        }
+        if (typeof value === 'string') {
+            var trimmed = value.trim();
+            return trimmed ? trimmed : null;
+        }
+        return null;
+    }
+
+    function extractUserId(value) {
+        if (!value || typeof value !== 'object') {
+            return null;
+        }
+        var direct = normalizeUserId(value.userId);
+        if (direct) {
+            return direct;
+        }
+        if (value.user && typeof value.user === 'object') {
+            var nested = normalizeUserId(value.user.id);
+            if (nested) {
+                return nested;
+            }
+        }
+        return null;
+    }
+
     function isLikelyFullSnapshot(players, action) {
         if (!Array.isArray(players) || players.length < 2) {
             return false;
@@ -369,6 +398,11 @@
             return null;
         }
 
+        var playerUserId = extractUserId(value);
+        if (!handState.heroUserId || !playerUserId || playerUserId !== handState.heroUserId) {
+            return null;
+        }
+
         var cards = extractCardsFromValue(value.cards, 2);
         if (!cards || cards.length !== 2) {
             return null;
@@ -451,6 +485,13 @@
                 return startPayload;
             }
 
+            if (action === 'authenticated') {
+                var authenticatedUserId = extractUserId(value);
+                if (authenticatedUserId) {
+                    handState.heroUserId = authenticatedUserId;
+                }
+            }
+
             if (action === 'resetTable' || action === 'finishHand') {
                 handState.boardCount = 0;
                 handState.holeSentForHand = false;
@@ -485,23 +526,44 @@
                     return holePayload;
                 }
                 if (Array.isArray(value.players)) {
-                    var visibleHands = [];
-                    for (var p = 0; p < value.players.length; p += 1) {
-                        var player = value.players[p];
-                        if (player && Array.isArray(player.cards)) {
-                            var playerCards = extractCardsFromValue(player.cards, 2);
-                            if (playerCards && playerCards.length === 2) {
-                                visibleHands.push(playerCards);
+                    if (handState.heroUserId) {
+                        for (var hp = 0; hp < value.players.length; hp += 1) {
+                            var heroPlayer = value.players[hp];
+                            if (extractUserId(heroPlayer) !== handState.heroUserId) {
+                                continue;
                             }
+                            var heroCards = heroPlayer && Array.isArray(heroPlayer.cards) ? extractCardsFromValue(heroPlayer.cards, 2) : null;
+                            if (heroCards && heroCards.length === 2) {
+                                handState.holeSentForHand = true;
+                                var heroHolePayload = { type: 'poker_cards', hole: heroCards };
+                                if (playersCount !== null) {
+                                    heroHolePayload.players = playersCount;
+                                }
+                                return heroHolePayload;
+                            }
+                            break;
                         }
                     }
-                    if (visibleHands.length === 1) {
-                        handState.holeSentForHand = true;
-                        var playerHolePayload = { type: 'poker_cards', hole: visibleHands[0] };
-                        if (playersCount !== null) {
-                            playerHolePayload.players = playersCount;
+
+                    if (!handState.heroUserId) {
+                        var visibleHands = [];
+                        for (var p = 0; p < value.players.length; p += 1) {
+                            var player = value.players[p];
+                            if (player && Array.isArray(player.cards)) {
+                                var playerCards = extractCardsFromValue(player.cards, 2);
+                                if (playerCards && playerCards.length === 2) {
+                                    visibleHands.push(playerCards);
+                                }
+                            }
                         }
-                        return playerHolePayload;
+                        if (visibleHands.length === 1) {
+                            handState.holeSentForHand = true;
+                            var playerHolePayload = { type: 'poker_cards', hole: visibleHands[0] };
+                            if (playersCount !== null) {
+                                playerHolePayload.players = playersCount;
+                            }
+                            return playerHolePayload;
+                        }
                     }
                 }
             }
