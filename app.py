@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import re
-import sys
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -148,6 +147,7 @@ class PreflopApp(tk.Tk):
         self.server_toggle_button: tk.Button | None = None
         self.server_log_widget: tk.Text | None = None
         self.strategy_frame: tk.Frame | None = None
+        self.training_status_label: tk.Label | None = None
         self.strategy_context_label: tk.Label | None = None
         self.strategy_advice_label: tk.Label | None = None
         self.odds_after_id: str | None = None
@@ -172,6 +172,7 @@ class PreflopApp(tk.Tk):
         self._app_actions_log_file = Path(__file__).resolve().parent / "app-actions.log"
         self._strategy_training_log_file = Path(__file__).resolve().parent / "strategy-training.log"
         self.strategy_context_var = tk.StringVar(value="Street: - | Pot: - | To call: - | Aggression: -")
+        self.training_status_var = tk.StringVar(value="Training: paused (no hero hole cards)")
         self.strategy_advice_var = tk.StringVar(
             value=(
                 "Smart play coach active. Start the bridge to read live bets and action flow. "
@@ -181,6 +182,7 @@ class PreflopApp(tk.Tk):
         self._street = "preflop"
         self._hero_seat_id: int | None = None
         self._hero_user_id: int | None = None
+        self._hero_sitting_out: bool | None = None
         self._pot_chips: int | None = None
         self._to_call_chips: int | None = None
         self._strategy_players_count: int | None = None
@@ -191,7 +193,11 @@ class PreflopApp(tk.Tk):
         self._hand_outcome: str = "unknown"
         self._hand_hero_winnings: int | None = None
         self._hand_hero_showdown: dict[str, object] | None = None
+        self._hero_hand_start_stack: int | None = None
+        self._hero_hand_end_stack: int | None = None
+        self._saw_showdown_this_hand = False
         self._awaiting_hero_hole_after_reset = False
+        self._decision_advice_locks: dict[str, dict[str, str]] = {}
 
         self.board_cards: dict[str, Card | None] = {
             "flop_1": None,
@@ -210,6 +216,18 @@ class PreflopApp(tk.Tk):
         self._refresh_board_buttons()
         self._apply_scale()
         self._schedule_server_poll()
+        self.after(120, self._ensure_window_visible)
+
+    def _ensure_window_visible(self) -> None:
+        if not self.winfo_exists():
+            return
+        try:
+            if self.state() == "iconic":
+                self.deiconify()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            return
 
     def _format_card_display(self, card: Card) -> str:
         return f"{self._display_rank(card.rank)}{SUIT_SYMBOLS[card.suit]}"
@@ -408,10 +426,21 @@ class PreflopApp(tk.Tk):
         frame = tk.Frame(root, bg=BG_PANEL, padx=10, pady=10, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1)
         frame.grid(row=2, column=2, sticky="nsew")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
+        frame.rowconfigure(3, weight=1)
         self.strategy_frame = frame
 
         tk.Label(frame, text="Smart Play Coach", font=self.fonts["section"], bg=BG_PANEL, fg=FG_MAIN).grid(row=0, column=0, sticky="w")
+        self.training_status_label = tk.Label(
+            frame,
+            textvariable=self.training_status_var,
+            font=self.fonts["small"],
+            bg=BG_PANEL,
+            fg=FG_MUTED,
+            justify="left",
+            anchor="w",
+            wraplength=280,
+        )
+        self.training_status_label.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self.strategy_context_label = tk.Label(
             frame,
             textvariable=self.strategy_context_var,
@@ -422,7 +451,7 @@ class PreflopApp(tk.Tk):
             anchor="w",
             wraplength=280,
         )
-        self.strategy_context_label.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.strategy_context_label.grid(row=2, column=0, sticky="ew", pady=(6, 0))
         self.strategy_advice_label = tk.Label(
             frame,
             textvariable=self.strategy_advice_var,
@@ -433,7 +462,7 @@ class PreflopApp(tk.Tk):
             anchor="nw",
             wraplength=280,
         )
-        self.strategy_advice_label.grid(row=2, column=0, sticky="nsew", pady=(10, 0))
+        self.strategy_advice_label.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
 
     def _clear_server_log(self) -> None:
         if self.server_log_widget is not None:
@@ -446,6 +475,17 @@ class PreflopApp(tk.Tk):
         self.server_log_widget.see(tk.END)
 
     def _log_app_action(self, event: str, **fields: object) -> None:
+        noisy_events_without_hole = {
+            "bridge_line_received",
+            "process_console_line_start",
+            "process_console_line_skip",
+            "strategy_line_skip",
+            "strategy_line_processed",
+        }
+        if len(self.selected) < 2 and event in noisy_events_without_hole:
+            return
+        if self._hero_sitting_out is True and event in noisy_events_without_hole:
+            return
         record = {
             "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "event": event,
@@ -470,7 +510,10 @@ class PreflopApp(tk.Tk):
         return text.splitlines()[0].strip()
 
     def _strategy_recommendation(self) -> str:
-        headline = self._strategy_headline().upper()
+        return self._recommendation_from_headline(self._strategy_headline())
+
+    def _recommendation_from_headline(self, headline: str) -> str:
+        headline = headline.upper()
         if "FOLD" in headline:
             return "fold"
         if "CALL" in headline and "RAISE" in headline:
@@ -489,7 +532,58 @@ class PreflopApp(tk.Tk):
             return "wait"
         return "mixed"
 
+    def _decision_lock_key(self, players: int) -> str:
+        payload = {
+            "hand_id": self._current_hand_id,
+            "street": self._street,
+            "players": players,
+            "pot": self._pot_chips,
+            "to_call": self._to_call_chips,
+            "hole": [card.code for card in self.selected],
+            "board": [card.code for card in self.board_cards.values() if card is not None],
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=True)
+
+    def _is_high_card_only(self, made_hand_text: str) -> bool:
+        normalized = made_hand_text.strip().lower()
+        if not normalized:
+            return False
+        return normalized.startswith("high card")
+
+    def _enforce_advice_consistency(
+        self,
+        headline: str,
+        details: list[str],
+        made_hand_text: str,
+        to_call: int,
+    ) -> tuple[str, list[str]]:
+        normalized_headline = headline.upper()
+        high_card_only = self._is_high_card_only(made_hand_text)
+
+        # Guard against contradictory "air" labels when we actually have made strength.
+        if "AIR" in normalized_headline and not high_card_only:
+            if to_call > 0:
+                headline = "SHOWDOWN VALUE. CALL SMALL, FOLD TO HEAT."
+            else:
+                headline = "SHOWDOWN VALUE. CHECK."
+            if made_hand_text:
+                details.insert(0, f"Made hand is {made_hand_text.lower()}, so this is not pure air.")
+
+        # Guard against value headlines when the hand is really just high card.
+        if "VALUE HAND" in headline.upper() and high_card_only:
+            if to_call > 0:
+                headline = "RIVER AIR. FOLD."
+            else:
+                headline = "RIVER AIR. CHECK."
+            details.insert(0, "This is high-card showdown value only, not a clean value-bet spot.")
+
+        return headline, details
+
     def _write_strategy_training_event(self, event: str, **fields: object) -> None:
+        if self._hero_sitting_out is True:
+            return
+        if len(self.selected) < 2 and event != "hole_set":
+            return
         record: dict[str, object] = {
             "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "schema": "poker_strategy_training_v1",
@@ -515,6 +609,10 @@ class PreflopApp(tk.Tk):
             pass
 
     def _capture_advice_snapshot(self, trigger: str, force: bool = False) -> None:
+        if self._hero_sitting_out is True:
+            return
+        if len(self.selected) < 2:
+            return
         signature_payload = {
             "hand_id": self._current_hand_id,
             "street": self._street,
@@ -541,6 +639,10 @@ class PreflopApp(tk.Tk):
         self._hand_outcome = "unknown"
         self._hand_hero_winnings = None
         self._hand_hero_showdown = None
+        self._hero_hand_start_stack = None
+        self._hero_hand_end_stack = None
+        self._saw_showdown_this_hand = False
+        self._decision_advice_locks = {}
 
     def _set_server_status(self, text: str, online: bool) -> None:
         self.server_status_var.set(text)
@@ -632,7 +734,10 @@ class PreflopApp(tk.Tk):
     def _extract_cards_from_text(self, text: str) -> list[str]:
         return [match.upper() for match in re.findall(r"\b([2-9TJQKA][CDHScdhs])\b", text)]
 
-    def _parse_tagged_bridge_payload(self, payload: object) -> tuple[list[str], list[str] | None, int | None, bool] | None:
+    def _parse_tagged_bridge_payload(
+        self,
+        payload: object,
+    ) -> tuple[list[str], list[str] | None, int | None, bool, int | None, int | None, int | None, bool | None] | None:
         if not isinstance(payload, dict):
             return None
         if payload.get("type") != "poker_cards":
@@ -642,7 +747,11 @@ class PreflopApp(tk.Tk):
         has_board = "board" in payload
         has_players = "players" in payload
         has_reset = "reset" in payload
-        if not has_hole and not has_board and not has_players and not has_reset:
+        has_hand_id = "handId" in payload or "hand_id" in payload
+        has_hero_user_id = "heroUserId" in payload or "hero_user_id" in payload
+        has_hero_seat_id = "heroSeatId" in payload or "hero_seat_id" in payload
+        has_hero_sitting_out = "heroSittingOut" in payload or "hero_sitting_out" in payload
+        if not has_hole and not has_board and not has_players and not has_reset and not has_hand_id and not has_hero_user_id and not has_hero_seat_id and not has_hero_sitting_out:
             return None
 
         hole_cards: list[str] = []
@@ -674,7 +783,68 @@ class PreflopApp(tk.Tk):
                 return None
             reset_state = reset_raw
 
-        return hole_cards, board_cards, players_count, reset_state
+        hand_raw = payload.get("handId", payload.get("hand_id"))
+        hand_id: int | None = hand_raw if isinstance(hand_raw, int) else None
+
+        hero_user_raw = payload.get("heroUserId", payload.get("hero_user_id"))
+        hero_user_id: int | None = None
+        if isinstance(hero_user_raw, int):
+            hero_user_id = hero_user_raw
+        elif isinstance(hero_user_raw, str):
+            trimmed = hero_user_raw.strip()
+            if trimmed.isdigit():
+                hero_user_id = int(trimmed)
+
+        hero_seat_raw = payload.get("heroSeatId", payload.get("hero_seat_id"))
+        hero_seat_id: int | None = hero_seat_raw if isinstance(hero_seat_raw, int) else None
+
+        hero_sitting_out_raw = payload.get("heroSittingOut", payload.get("hero_sitting_out"))
+        hero_sitting_out: bool | None = hero_sitting_out_raw if isinstance(hero_sitting_out_raw, bool) else None
+
+        return (
+            hole_cards,
+            board_cards,
+            players_count,
+            reset_state,
+            hand_id,
+            hero_user_id,
+            hero_seat_id,
+            hero_sitting_out,
+        )
+
+    def _extract_player_user_id(self, player: object) -> int | None:
+        if not isinstance(player, dict):
+            return None
+        direct = player.get("userId")
+        if isinstance(direct, int):
+            return direct
+        if isinstance(direct, str):
+            trimmed = direct.strip()
+            if trimmed.isdigit():
+                return int(trimmed)
+        nested = player.get("user")
+        if isinstance(nested, dict):
+            nested_id = nested.get("id")
+            if isinstance(nested_id, int):
+                return nested_id
+            if isinstance(nested_id, str):
+                trimmed_nested = nested_id.strip()
+                if trimmed_nested.isdigit():
+                    return int(trimmed_nested)
+        return None
+
+    def _player_is_sitting_out(self, player: object) -> bool:
+        if not isinstance(player, dict):
+            return False
+        state = str(player.get("state", "")).lower()
+        if state in {"sitout", "sittingout", "out"}:
+            return True
+        sitout_flags = ("sitOut", "sittingOut", "isSittingOut", "sitout")
+        for flag in sitout_flags:
+            value = player.get(flag)
+            if value is True:
+                return True
+        return False
 
     def _process_console_line(self, raw_line: str) -> None:
         line = raw_line.strip()
@@ -702,8 +872,17 @@ class PreflopApp(tk.Tk):
 
         self._append_server_log(f"[bridge] accepted tagged payload: {payload!r}")
         self._log_app_action("process_console_line_accept", payload=payload)
-        hole_cards, board_cards, players_count, reset_state = parsed
-        self._apply_external_cards(hole_cards, board_cards, players_count, reset_state)
+        hole_cards, board_cards, players_count, reset_state, hand_id, hero_user_id, hero_seat_id, hero_sitting_out = parsed
+        self._apply_external_cards(
+            hole_cards,
+            board_cards,
+            players_count,
+            reset_state,
+            hand_id=hand_id,
+            hero_user_id=hero_user_id,
+            hero_seat_id=hero_seat_id,
+            hero_sitting_out=hero_sitting_out,
+        )
 
     def _extract_json_from_console_line(self, line: str) -> dict[str, object] | None:
         if "... [truncated]" in line or "...[truncated]" in line:
@@ -801,33 +980,80 @@ class PreflopApp(tk.Tk):
             self._to_call_chips = None
             self._recent_actions = []
             self._allin_pressure = False
-            self._write_strategy_training_event(
-                "hand_start",
-                dealer_seat=update.get("dealerSeat"),
-                seats=update.get("seats"),
-            )
+            self._hero_sitting_out = None
+
+            seats = update.get("seats")
+            if isinstance(seats, list) and self._hero_user_id is not None:
+                for seat in seats:
+                    if not isinstance(seat, dict):
+                        continue
+                    seat_user_id = self._extract_player_user_id(seat)
+                    if seat_user_id != self._hero_user_id:
+                        continue
+                    seat_id = seat.get("id")
+                    if isinstance(seat_id, int):
+                        self._hero_seat_id = seat_id
+                    stack_value = seat.get("stack")
+                    if isinstance(stack_value, int):
+                        self._hero_hand_start_stack = stack_value
+                    self._hero_sitting_out = self._player_is_sitting_out(seat)
+                    break
 
         players = update.get("players")
         players_count = self._players_active_from_snapshot(players)
         if players_count is not None:
             self._strategy_players_count = players_count
 
+        hero_player: dict[str, object] | None = None
         if isinstance(players, list):
             for player in players:
                 if not isinstance(player, dict):
                     continue
-                cards = player.get("cards")
-                if isinstance(cards, list) and len(cards) == 2:
-                    shown = [str(card).upper() for card in cards]
-                    if all(card in {"X", "XX"} for card in shown):
+                player_user_id = self._extract_player_user_id(player)
+                if self._hero_user_id is not None and player_user_id == self._hero_user_id:
+                    hero_player = player
+                    seat = player.get("seatId")
+                    if isinstance(seat, int):
+                        self._hero_seat_id = seat
+                    break
+
+            if hero_player is None and self._hero_seat_id is not None:
+                for player in players:
+                    if not isinstance(player, dict):
                         continue
-                    if all(re.fullmatch(r"[2-9TJQKA][CDHS]", card) for card in shown):
-                        seat = player.get("seatId")
-                        if isinstance(seat, int):
-                            self._hero_seat_id = seat
-                        user_id = player.get("userId")
-                        if isinstance(user_id, int):
-                            self._hero_user_id = user_id
+                    if player.get("seatId") == self._hero_seat_id:
+                        hero_player = player
+                        player_user_id = self._extract_player_user_id(player)
+                        if player_user_id is not None:
+                            self._hero_user_id = player_user_id
+                        break
+
+            if hero_player is not None:
+                self._hero_sitting_out = self._player_is_sitting_out(hero_player)
+
+        if action_lower == "starthand" and self._hero_sitting_out is not True:
+            self._write_strategy_training_event(
+                "hand_start",
+                dealer_seat=update.get("dealerSeat"),
+                seats=update.get("seats"),
+            )
+
+        seats_snapshot = update.get("seats")
+        if isinstance(seats_snapshot, list) and self._hero_user_id is not None:
+            for seat in seats_snapshot:
+                if not isinstance(seat, dict):
+                    continue
+                seat_user_id = self._extract_player_user_id(seat)
+                if seat_user_id != self._hero_user_id:
+                    continue
+                seat_id = seat.get("id")
+                if isinstance(seat_id, int):
+                    self._hero_seat_id = seat_id
+                stack_value = seat.get("stack")
+                if isinstance(stack_value, int) and self._hero_hand_start_stack is None:
+                    self._hero_hand_start_stack = stack_value
+                self._hero_sitting_out = self._player_is_sitting_out(seat)
+                break
 
         if isinstance(players, list) and self._hero_seat_id is not None:
             hero = next((p for p in players if isinstance(p, dict) and p.get("seatId") == self._hero_seat_id), None)
@@ -866,7 +1092,31 @@ class PreflopApp(tk.Tk):
                     winnings = player.get("winnings")
                     if isinstance(winnings, int):
                         self._hand_hero_winnings = winnings
-                        self._hand_outcome = "won" if winnings > 0 else "lost"
+
+            pot = update.get("pot")
+            if isinstance(pot, dict) and self._hero_seat_id is not None:
+                pot_players = pot.get("players")
+                if isinstance(pot_players, list):
+                    for player in pot_players:
+                        if not isinstance(player, dict):
+                            continue
+                        if player.get("seatId") != self._hero_seat_id:
+                            continue
+                        winnings = player.get("winnings")
+                        if isinstance(winnings, int):
+                            self._hand_hero_winnings = winnings
+                        break
+
+            if isinstance(self._hand_hero_winnings, int):
+                if self._hand_hero_winnings > 0:
+                    self._hand_outcome = "won"
+                elif self._hand_hero_winnings == 0 and self._saw_showdown_this_hand:
+                    self._hand_outcome = "split"
+                else:
+                    self._hand_outcome = "lost"
+
+        if action_lower == "showdown":
+            self._saw_showdown_this_hand = True
 
         if action_lower == "show":
             shown_players = update.get("players")
@@ -890,7 +1140,7 @@ class PreflopApp(tk.Tk):
 
         if action_lower in {"fold", "check", "call", "bet", "raise", "allin"}:
             seat_id = update.get("seatId")
-            if self._hero_seat_id is not None and isinstance(seat_id, int) and seat_id == self._hero_seat_id:
+            if self._hero_sitting_out is not True and self._hero_seat_id is not None and isinstance(seat_id, int) and seat_id == self._hero_seat_id:
                 self._write_strategy_training_event(
                     "hero_action",
                     action=action_lower,
@@ -899,14 +1149,40 @@ class PreflopApp(tk.Tk):
                 )
 
         if action_lower == "finishhand":
-            self._capture_advice_snapshot("finish_hand", force=True)
-            self._write_strategy_training_event(
-                "hand_end",
-                outcome=self._hand_outcome,
-                hero_winnings=self._hand_hero_winnings,
-                hero_showdown=self._hand_hero_showdown,
-                finished_at=update.get("finishedAt"),
-            )
+            seats = update.get("seats")
+            if isinstance(seats, list) and self._hero_seat_id is not None:
+                for seat in seats:
+                    if not isinstance(seat, dict):
+                        continue
+                    if seat.get("id") != self._hero_seat_id:
+                        continue
+                    stack_value = seat.get("stack")
+                    if isinstance(stack_value, int):
+                        self._hero_hand_end_stack = stack_value
+                    break
+
+            if self._hand_hero_winnings is None and isinstance(self._hero_hand_start_stack, int) and isinstance(self._hero_hand_end_stack, int):
+                self._hand_hero_winnings = self._hero_hand_end_stack - self._hero_hand_start_stack
+
+            if self._hand_outcome == "unknown" and isinstance(self._hand_hero_winnings, int):
+                if self._hand_hero_winnings > 0:
+                    self._hand_outcome = "won"
+                elif self._hand_hero_winnings == 0 and self._saw_showdown_this_hand:
+                    self._hand_outcome = "split"
+                elif self._hand_hero_winnings < 0:
+                    self._hand_outcome = "lost"
+
+            if self._hero_sitting_out is not True:
+                self._capture_advice_snapshot("finish_hand", force=True)
+                self._write_strategy_training_event(
+                    "hand_end",
+                    outcome=self._hand_outcome,
+                    hero_winnings=self._hand_hero_winnings,
+                    hero_showdown=self._hand_hero_showdown,
+                    hero_start_stack=self._hero_hand_start_stack,
+                    hero_end_stack=self._hero_hand_end_stack,
+                    finished_at=update.get("finishedAt"),
+                )
 
     def _update_strategy_from_console_line(self, line: str) -> None:
         if not line.startswith("[RAW_CONSOLE]"):
@@ -922,6 +1198,14 @@ class PreflopApp(tk.Tk):
             self._update_strategy_panel()
             self._log_app_action("strategy_line_skip", reason="no_json_payload")
             return
+
+        payload_user = payload.get("userId")
+        payload_table = payload.get("tableId")
+        if self._hero_user_id is None and isinstance(payload_table, int):
+            if isinstance(payload_user, int):
+                self._hero_user_id = payload_user
+            elif isinstance(payload_user, str) and payload_user.strip().isdigit():
+                self._hero_user_id = int(payload_user.strip())
 
         updates = payload.get("updates")
         if isinstance(updates, list):
@@ -944,13 +1228,24 @@ class PreflopApp(tk.Tk):
         players_source = self._strategy_players_count if self._strategy_players_count is not None else self.players_var.get()
         players = max(2, min(10, players_source))
 
+        if self._hero_sitting_out is True:
+            self.training_status_var.set("Training: paused (hero sitting out)")
+            self.strategy_advice_var.set(
+                "SITTING OUT. TRAINING PAUSED.\n"
+                "No strategy or training events are logged until you are back in a hand."
+            )
+            return
+
         if len(self.selected) < 2:
+            self.training_status_var.set("Training: paused (no hero hole cards)")
             self.strategy_advice_var.set(
                 "WAIT FOR HOLE CARDS.\n"
                 "No decision yet. Once your two cards arrive, the coach will give a direct action line first and short reasoning underneath."
             )
             self._capture_advice_snapshot("panel_wait")
             return
+
+        self.training_status_var.set("Training: active")
 
         preflop = evaluate_preflop(self.selected[0].code, self.selected[1].code)
         equity = self._equity_fraction()
@@ -1009,11 +1304,11 @@ class PreflopApp(tk.Tk):
                 headline = "TRASH HAND. FOLD."
                 details.append("Without a real steal spot, this is not worth opening.")
         else:
-            if board_count == 5 and to_call > 0 and made_hand_lower.endswith("high"):
+            if board_count == 5 and to_call > 0 and self._is_high_card_only(made_hand_lower):
                 headline = "RIVER AIR. FOLD."
                 if made_hand:
                     details.append(f"Your made hand is only {made_hand.lower()}. Do not pay off with air just because the price looks close.")
-            elif board_count == 5 and to_call == 0 and made_hand_lower.endswith("high"):
+            elif board_count == 5 and to_call == 0 and self._is_high_card_only(made_hand_lower):
                 headline = "RIVER AIR. CHECK."
                 if made_hand:
                     details.append(f"Your made hand is only {made_hand.lower()}. Take the free card/showdown instead of forcing action.")
@@ -1095,7 +1390,34 @@ class PreflopApp(tk.Tk):
             headline = "DEFAULT TO SMALL BALL."
             details.append("Nothing is screaming for a huge pot here. Keep ranges wide, sizes honest, and mistakes cheap.")
 
-        self.strategy_advice_var.set(headline + "\n" + " ".join(details))
+        headline, details = self._enforce_advice_consistency(
+            headline,
+            details,
+            made_hand_lower,
+            to_call,
+        )
+
+        advice_text = headline + "\n" + " ".join(details)
+        recommendation = self._recommendation_from_headline(headline)
+        decision_key = self._decision_lock_key(players)
+        lock = self._decision_advice_locks.get(decision_key)
+        if lock is not None and lock.get("recommendation") != recommendation:
+            headline = lock.get("headline", headline)
+            advice_text = lock.get("advice_text", advice_text)
+            self._log_app_action(
+                "strategy_decision_locked",
+                decision_key=decision_key,
+                locked_recommendation=lock.get("recommendation"),
+                incoming_recommendation=recommendation,
+            )
+        else:
+            self._decision_advice_locks[decision_key] = {
+                "headline": headline,
+                "recommendation": recommendation,
+                "advice_text": advice_text,
+            }
+
+        self.strategy_advice_var.set(advice_text)
         self._capture_advice_snapshot("panel_update")
 
     def _card_from_code(self, code: str) -> Card | None:
@@ -1108,14 +1430,45 @@ class PreflopApp(tk.Tk):
             return None
         return Card(rank=rank, suit=suit)
 
-    def _apply_external_cards(self, hole_cards: list[str], board_cards: list[str] | None, players_count: int | None = None, reset_state: bool = False) -> None:
+    def _apply_external_cards(
+        self,
+        hole_cards: list[str],
+        board_cards: list[str] | None,
+        players_count: int | None = None,
+        reset_state: bool = False,
+        hand_id: int | None = None,
+        hero_user_id: int | None = None,
+        hero_seat_id: int | None = None,
+        hero_sitting_out: bool | None = None,
+    ) -> None:
         self._log_app_action(
             "apply_external_cards_start",
             hole_cards=hole_cards,
             board_cards=board_cards,
             players_count=players_count,
             reset_state=reset_state,
+            hand_id=hand_id,
+            hero_user_id=hero_user_id,
+            hero_seat_id=hero_seat_id,
+            hero_sitting_out=hero_sitting_out,
         )
+
+        if hand_id is not None:
+            if self._current_hand_id is not None and hand_id < self._current_hand_id:
+                self._append_server_log(f"[bridge] ignored stale payload for hand {hand_id} < current {self._current_hand_id}")
+                self._log_app_action("apply_external_cards_skip", reason="stale_hand_id", hand_id=hand_id, current_hand_id=self._current_hand_id)
+                return
+            if self._current_hand_id is None or hand_id > self._current_hand_id:
+                reset_state = True
+            self._current_hand_id = hand_id
+
+        if hero_user_id is not None:
+            self._hero_user_id = hero_user_id
+        if hero_seat_id is not None:
+            self._hero_seat_id = hero_seat_id
+        if hero_sitting_out is not None:
+            self._hero_sitting_out = hero_sitting_out
+
         parsed_hole: list[Card] = []
         parsed_board: list[Card] = []
 
@@ -1181,6 +1534,7 @@ class PreflopApp(tk.Tk):
         if parsed_hole:
             self.selected = parsed_hole
             self._awaiting_hero_hole_after_reset = False
+            self._hero_sitting_out = False
         hole_changed = bool(parsed_hole) and [card.code for card in self.selected] != previous_hole_codes
 
         if board_cards is not None:

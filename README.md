@@ -9,7 +9,7 @@ This project is nearly completely generated with co-pilot.
 - Lets you set hero hole cards and community cards in a desktop UI.
 - Simulates win/tie/loss equity against a configurable number of players.
 - Shows hand-category distribution odds.
-- Runs a local browser bridge server for live updates.
+- Opionally runs a local browser bridge server on https://casino.org/replay poker and automatically picks cards.s
 - Logs advice and outcomes for strategy review.
 
 ## Features

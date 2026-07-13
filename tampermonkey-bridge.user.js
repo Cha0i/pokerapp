@@ -34,7 +34,9 @@
         activeCount: null,
         boardCount: 0,
         holeSentForHand: false,
-        heroUserId: null
+        heroUserId: null,
+        heroSeatId: null,
+        heroSittingOut: null
     };
 
     function currentBridgeUrl() {
@@ -223,6 +225,22 @@
         return true;
     }
 
+    function isPlayerSittingOut(player) {
+        if (!player || typeof player !== 'object') {
+            return false;
+        }
+        if (player.sitOut === true || player.sittingOut === true || player.isSittingOut === true) {
+            return true;
+        }
+        if (typeof player.state === 'string') {
+            var state = player.state.toLowerCase();
+            if (state === 'sitout' || state === 'sittingout' || state === 'out') {
+                return true;
+            }
+        }
+        return false;
+    }
+
     function getSeatId(player) {
         if (!player || typeof player !== 'object') {
             return null;
@@ -384,6 +402,47 @@
         return Math.max(2, Math.min(10, active));
     }
 
+    function attachContext(payload, handId) {
+        if (!payload || typeof payload !== 'object') {
+            return payload;
+        }
+        var contextHandId = typeof handId === 'number' ? handId : handState.handId;
+        if (typeof contextHandId === 'number') {
+            payload.handId = contextHandId;
+        }
+        if (handState.heroUserId) {
+            payload.heroUserId = handState.heroUserId;
+        }
+        if (typeof handState.heroSeatId === 'number') {
+            payload.heroSeatId = handState.heroSeatId;
+        }
+        if (typeof handState.heroSittingOut === 'boolean') {
+            payload.heroSittingOut = handState.heroSittingOut;
+        }
+        return payload;
+    }
+
+    function refreshHeroContext(players) {
+        if (!Array.isArray(players) || !handState.heroUserId) {
+            return;
+        }
+        for (var i = 0; i < players.length; i += 1) {
+            var player = players[i];
+            if (!player || typeof player !== 'object') {
+                continue;
+            }
+            if (extractUserId(player) !== handState.heroUserId) {
+                continue;
+            }
+            var seatId = getSeatId(player);
+            if (seatId !== null) {
+                handState.heroSeatId = seatId;
+            }
+            handState.heroSittingOut = isPlayerSittingOut(player);
+            return;
+        }
+    }
+
     function maybeHolePayloadFromPlayerObject(value, playersCount) {
         if (!value || typeof value !== 'object') {
             return null;
@@ -399,9 +458,22 @@
         }
 
         var playerUserId = extractUserId(value);
-        if (!handState.heroUserId || !playerUserId || playerUserId !== handState.heroUserId) {
+        var playerSeatId = getSeatId(value);
+        var matchesHero = false;
+        if (handState.heroUserId && playerUserId && playerUserId === handState.heroUserId) {
+            matchesHero = true;
+        }
+        if (!matchesHero && typeof handState.heroSeatId === 'number' && typeof playerSeatId === 'number' && playerSeatId === handState.heroSeatId) {
+            matchesHero = true;
+        }
+        if (!matchesHero) {
             return null;
         }
+
+        if (typeof playerSeatId === 'number') {
+            handState.heroSeatId = playerSeatId;
+        }
+        handState.heroSittingOut = isPlayerSittingOut(value);
 
         var cards = extractCardsFromValue(value.cards, 2);
         if (!cards || cards.length !== 2) {
@@ -413,7 +485,7 @@
         if (playersCount !== null) {
             payload.players = playersCount;
         }
-        return payload;
+        return attachContext(payload, handState.handId);
     }
 
     function extractCardsFromValue(value, maxCount) {
@@ -450,6 +522,13 @@
         if (seen.indexOf(value) !== -1) {
             return null;
         }
+
+        if (!handState.heroUserId) {
+            var candidateUserId = extractUserId(value);
+            if (candidateUserId && (Object.prototype.hasOwnProperty.call(value, 'token') || Object.prototype.hasOwnProperty.call(value, 'tableId'))) {
+                handState.heroUserId = candidateUserId;
+            }
+        }
         seen.push(value);
 
         if (Array.isArray(value)) {
@@ -465,10 +544,14 @@
         if (Object.prototype.hasOwnProperty.call(value, 'action')) {
             var action = String(value.action || '');
             var handId = typeof value.handId === 'number' ? value.handId : null;
+            if (handId !== null) {
+                handState.handId = handId;
+            }
             var playersCount = rebuildActiveSeatsFromPlayers(value.players, handId, action);
             if (playersCount === null && isTrustedPlayersAction(action)) {
                 playersCount = extractPlayersCount(value.players);
             }
+            refreshHeroContext(value.players);
 
             if (action === 'startHand') {
                 if (handId !== null) {
@@ -482,13 +565,15 @@
                 if (playersCount !== null) {
                     startPayload.players = playersCount;
                 }
-                return startPayload;
+                return attachContext(startPayload, handId);
             }
 
             if (action === 'authenticated') {
                 var authenticatedUserId = extractUserId(value);
                 if (authenticatedUserId) {
                     handState.heroUserId = authenticatedUserId;
+                    handState.heroSeatId = null;
+                    handState.heroSittingOut = null;
                 }
             }
 
@@ -500,7 +585,7 @@
             if (action === 'fold') {
                 var foldedCount = markSeatFolded(value.seatId, handId);
                 if (foldedCount !== null) {
-                    return { type: 'poker_cards', players: foldedCount };
+                    return attachContext({ type: 'poker_cards', players: foldedCount }, handId);
                 }
             }
 
@@ -512,7 +597,7 @@
                     if (playersCount !== null) {
                         boardPayload.players = playersCount;
                     }
-                    return boardPayload;
+                    return attachContext(boardPayload, handId);
                 }
             }
             if (action === 'dealHoleCards') {
@@ -523,59 +608,75 @@
                     if (playersCount !== null) {
                         holePayload.players = playersCount;
                     }
-                    return holePayload;
+                    return attachContext(holePayload, handId);
                 }
                 if (Array.isArray(value.players)) {
-                    if (handState.heroUserId) {
-                        for (var hp = 0; hp < value.players.length; hp += 1) {
-                            var heroPlayer = value.players[hp];
-                            if (extractUserId(heroPlayer) !== handState.heroUserId) {
-                                continue;
-                            }
-                            var heroCards = heroPlayer && Array.isArray(heroPlayer.cards) ? extractCardsFromValue(heroPlayer.cards, 2) : null;
-                            if (heroCards && heroCards.length === 2) {
-                                handState.holeSentForHand = true;
-                                var heroHolePayload = { type: 'poker_cards', hole: heroCards };
-                                if (playersCount !== null) {
-                                    heroHolePayload.players = playersCount;
-                                }
-                                return heroHolePayload;
-                            }
-                            break;
+                    var candidates = [];
+                    for (var p = 0; p < value.players.length; p += 1) {
+                        var player = value.players[p];
+                        if (!player || typeof player !== 'object' || !Array.isArray(player.cards)) {
+                            continue;
                         }
+                        var playerCards = extractCardsFromValue(player.cards, 2);
+                        if (!playerCards || playerCards.length !== 2) {
+                            continue;
+                        }
+                        candidates.push({
+                            cards: playerCards,
+                            userId: extractUserId(player),
+                            seatId: getSeatId(player),
+                            sittingOut: isPlayerSittingOut(player)
+                        });
                     }
 
-                    if (!handState.heroUserId) {
-                        var visibleHands = [];
-                        for (var p = 0; p < value.players.length; p += 1) {
-                            var player = value.players[p];
-                            if (player && Array.isArray(player.cards)) {
-                                var playerCards = extractCardsFromValue(player.cards, 2);
-                                if (playerCards && playerCards.length === 2) {
-                                    visibleHands.push(playerCards);
-                                }
+                    var chosen = null;
+                    if (handState.heroUserId) {
+                        for (var hp = 0; hp < candidates.length; hp += 1) {
+                            if (candidates[hp].userId && candidates[hp].userId === handState.heroUserId) {
+                                chosen = candidates[hp];
+                                break;
                             }
                         }
-                        if (visibleHands.length === 1) {
-                            handState.holeSentForHand = true;
-                            var playerHolePayload = { type: 'poker_cards', hole: visibleHands[0] };
-                            if (playersCount !== null) {
-                                playerHolePayload.players = playersCount;
+                    }
+                    if (!chosen && typeof handState.heroSeatId === 'number') {
+                        for (var hs = 0; hs < candidates.length; hs += 1) {
+                            if (typeof candidates[hs].seatId === 'number' && candidates[hs].seatId === handState.heroSeatId) {
+                                chosen = candidates[hs];
+                                break;
                             }
-                            return playerHolePayload;
                         }
+                    }
+                    if (!chosen && candidates.length === 1) {
+                        chosen = candidates[0];
+                    }
+
+                    if (chosen) {
+                        handState.holeSentForHand = true;
+                        if (chosen.userId) {
+                            handState.heroUserId = chosen.userId;
+                        }
+                        if (typeof chosen.seatId === 'number') {
+                            handState.heroSeatId = chosen.seatId;
+                        }
+                        handState.heroSittingOut = chosen.sittingOut;
+
+                        var chosenHolePayload = { type: 'poker_cards', hole: chosen.cards };
+                        if (playersCount !== null) {
+                            chosenHolePayload.players = playersCount;
+                        }
+                        return attachContext(chosenHolePayload, handId);
                     }
                 }
             }
                 if (action === 'show' || action === 'showdown' || action === 'awardPot' || action === 'finishHand') {
                     if (playersCount !== null) {
-                        return { type: 'poker_cards', players: playersCount };
+                        return attachContext({ type: 'poker_cards', players: playersCount }, handId);
                     }
                     return null;
                 }
 
             if (playersCount !== null) {
-                return { type: 'poker_cards', players: playersCount };
+                return attachContext({ type: 'poker_cards', players: playersCount }, handId);
             }
         }
 
