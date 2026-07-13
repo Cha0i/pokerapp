@@ -56,6 +56,9 @@ browser-console.log
 # Scripts
 commit.sh
 
+# Database
+*.db
+
 # logs
 app-actions.log
 browser-console.log

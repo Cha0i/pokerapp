@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -80,8 +81,8 @@ class PreflopApp(tk.Tk):
         super().__init__()
         self._use_custom_chrome = True
         self.title("Poker Hand Trainers by Cha0i")
-        self.geometry("838x1563")
-        self.minsize(560, 520)
+        self.geometry("900x1600")
+        self.minsize(760, 520)
         self.resizable(True, True)
         self.configure(bg=BG_MAIN, highlightthickness=0, bd=0)
         self.option_add("*HighlightThickness", 0)
@@ -134,6 +135,8 @@ class PreflopApp(tk.Tk):
         self.advice_label: tk.Label | None = None
         self.current_hand_label: tk.Label | None = None
         self.maximize_button: tk.Button | None = None
+        self.hero_name_label: tk.Label | None = None
+        self.hero_name_entry: tk.Entry | None = None
         self.clear_hole_button: tk.Button | None = None
         self.clear_board_button: tk.Button | None = None
         self.reset_all_button: tk.Button | None = None
@@ -152,6 +155,14 @@ class PreflopApp(tk.Tk):
         self.strategy_quick_label: tk.Label | None = None
         self.strategy_quick_sub_label: tk.Label | None = None
         self.strategy_advice_label: tk.Label | None = None
+        self.player_tracker_frame: tk.Frame | None = None
+        self.player_tracker_tab_button: tk.Button | None = None
+        self.player_tracker_toggle_button: tk.Button | None = None
+        self.player_tracker_total_label: tk.Label | None = None
+        self.player_tracker_from_table_label: tk.Label | None = None
+        self.player_tracker_table_label: tk.Label | None = None
+        self.player_tracker_players_widget: tk.Text | None = None
+        self.player_tracker_recent_cards: list[tk.Label] = []
         self.odds_after_id: str | None = None
         self.hand_rank_after_id: str | None = None
         self.odds_cache: dict[tuple[str, str, tuple[str, ...], int], tuple[float, float, float]] = {}
@@ -165,6 +176,7 @@ class PreflopApp(tk.Tk):
 
         self.server_status_var = tk.StringVar(value="Bridge: offline")
         self.server_info_var = tk.StringVar(value="Send tagged JSON: TM_BRIDGE:{\"type\":\"poker_cards\",...}")
+        self.hero_name_var = tk.StringVar(value="player")
         self._server_running = False
         self._server: any = None
         self._server_thread: threading.Thread | None = None
@@ -173,10 +185,35 @@ class PreflopApp(tk.Tk):
         self._bridge_log_file = Path(__file__).resolve().parent / "browser-console.log"
         self._app_actions_log_file = Path(__file__).resolve().parent / "app-actions.log"
         self._strategy_training_log_file = Path(__file__).resolve().parent / "strategy-training.log"
+        self._player_tracker_db_file = Path(__file__).resolve().parent / "player-history.db"
+        self._player_tracker_db: sqlite3.Connection | None = None
+        self._tracker_visible = True
+        self._tracker_column_width = 320
+        self._tracker_tab_width = 40
+        self._min_width_with_tracker = 980
+        self._min_width_without_tracker = 760
+        self._shell_frame: tk.Frame | None = None
+        self._main_root_frame: tk.Frame | None = None
+        self._current_table_id: str | None = None
+        self._session_table_id: str | None = None
+        self._current_session_id: str | None = None
+        self._session_active = False
+        self._session_table_delta = 0
+        self._session_hands_buffer: list[dict[str, object]] = []
+        self._active_hand_record: dict[str, object] | None = None
+        self._player_screen_names: dict[int, str] = {}
+        self._seat_user_map: dict[int, int] = {}
+        self._current_hand_player_deltas: dict[int, int] = {}
+        self._current_hand_player_contrib: dict[int, int] = {}
+        self._current_hand_player_won: dict[int, int] = {}
+        self._current_hand_player_stacks: dict[int, int] = {}
         self.strategy_context_var = tk.StringVar(value="Street: - | Pot: - | To call: - | Aggression: -")
         self.training_status_var = tk.StringVar(value="Training: paused (no hero hole cards)")
         self.strategy_quick_var = tk.StringVar(value="WAIT")
         self.strategy_quick_sub_var = tk.StringVar(value="No hole cards")
+        self.player_tracker_total_var = tk.StringVar(value="♦ Total winnings: -")
+        self.player_tracker_from_table_var = tk.StringVar(value="◇ From this table: -")
+        self.player_tracker_table_var = tk.StringVar(value="⌂ Current table: -")
         self.strategy_advice_var = tk.StringVar(
             value=(
                 "Smart play coach active. Start the bridge to read live bets and action flow. "
@@ -189,8 +226,10 @@ class PreflopApp(tk.Tk):
         self._hero_sitting_out: bool | None = None
         self._pot_chips: int | None = None
         self._to_call_chips: int | None = None
+        self._minimum_raise_chips: int | None = None
         self._strategy_players_count: int | None = None
         self._allin_pressure = False
+        self._hero_acted_preflop = False
         self._recent_actions: list[str] = []
         self._current_hand_id: int | None = None
         self._hand_last_advice_signature: str | None = None
@@ -215,6 +254,7 @@ class PreflopApp(tk.Tk):
         if self._use_custom_chrome:
             self.bind("<Map>", self._restore_override_redirect)
         self.bind("<Configure>", self._schedule_layout_refresh)
+        self._init_player_tracker_db()
         self._build_ui()
         self._refresh_buttons()
         self._refresh_hole_buttons()
@@ -272,7 +312,9 @@ class PreflopApp(tk.Tk):
     def _build_ui(self) -> None:
         shell = tk.Frame(self, bg=BG_MAIN, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1, bd=0)
         shell.pack(fill="both", expand=True)
+        self._shell_frame = shell
         shell.columnconfigure(0, weight=1)
+        shell.columnconfigure(1, weight=0)
         shell.rowconfigure(1, weight=1)
 
         self._build_title_bar(shell)
@@ -280,6 +322,7 @@ class PreflopApp(tk.Tk):
 
         root = tk.Frame(shell, padx=10, pady=10, bg=BG_MAIN, highlightthickness=0, bd=0)
         root.grid(row=1, column=0, sticky="nsew")
+        self._main_root_frame = root
         root.columnconfigure(0, weight=1, uniform="top")
         root.columnconfigure(1, weight=2, uniform="top")
         root.columnconfigure(2, weight=1, uniform="top")
@@ -304,8 +347,14 @@ class PreflopApp(tk.Tk):
         )
         self.subtitle_label.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 8))
 
-        grid_frame = tk.Frame(root, bd=1, relief="solid", padx=6, pady=6, bg=BG_PANEL, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1)
-        grid_frame.grid(row=2, column=1, sticky="nsew", padx=(8, 8))
+        top_center = tk.Frame(root, bg=BG_MAIN)
+        top_center.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=(8, 0))
+        top_center.columnconfigure(0, weight=2)
+        top_center.columnconfigure(1, weight=1)
+        top_center.rowconfigure(0, weight=1)
+
+        grid_frame = tk.Frame(top_center, bd=1, relief="solid", padx=6, pady=6, bg=BG_PANEL, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1)
+        grid_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.grid_frame = grid_frame
         grid_frame.columnconfigure(0, weight=1)
         for col in range(1, 5):
@@ -351,7 +400,7 @@ class PreflopApp(tk.Tk):
                 self.card_buttons[card.code] = button
 
         self._build_server_column(root)
-        self._build_strategy_column(root)
+        self._build_strategy_column(top_center)
 
         info_row = tk.Frame(root, bg=BG_MAIN)
         info_row.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
@@ -364,6 +413,702 @@ class PreflopApp(tk.Tk):
         self._build_left_column(info_row)
         self._build_right_column(info_row)
         self._build_rank_column(info_row)
+
+        self._build_player_tracker_column(shell)
+        shell.columnconfigure(1, minsize=self._tracker_column_width)
+        self._set_player_tracker_visibility(False, resize_window=False)
+
+    def _build_player_tracker_column(self, shell: tk.Frame) -> None:
+        frame = tk.Frame(shell, bg=BG_PANEL, padx=10, pady=10, width=self._tracker_column_width, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1)
+        frame.grid(row=1, column=1, sticky="nsew")
+        frame.grid_propagate(False)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(6, weight=1)
+        self.player_tracker_frame = frame
+
+        tk.Label(frame, text="Player Tracker", font=self.fonts["section"], bg=BG_PANEL, fg=FG_MAIN).grid(row=0, column=0, sticky="w")
+        self.player_tracker_total_label = tk.Label(
+            frame,
+            textvariable=self.player_tracker_total_var,
+            font=self.fonts["label_large"],
+            bg=BG_PANEL,
+            fg="#2dc653",
+            justify="left",
+            anchor="w",
+        )
+        self.player_tracker_total_label.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.player_tracker_from_table_label = tk.Label(
+            frame,
+            textvariable=self.player_tracker_from_table_var,
+            font=self.fonts["label"],
+            bg=BG_PANEL,
+            fg="#6fdc8c",
+            justify="left",
+            anchor="w",
+        )
+        self.player_tracker_from_table_label.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        self.player_tracker_table_label = tk.Label(
+            frame,
+            textvariable=self.player_tracker_table_var,
+            font=self.fonts["label"],
+            bg=BG_PANEL,
+            fg=FG_MUTED,
+            justify="left",
+            anchor="w",
+        )
+        self.player_tracker_table_label.grid(row=3, column=0, sticky="ew", pady=(6, 0))
+
+        tk.Label(frame, text="♣ Table stacks", font=self.fonts["small"], bg=BG_PANEL, fg=FG_MUTED).grid(row=4, column=0, sticky="w", pady=(10, 0))
+        self.player_tracker_players_widget = tk.Text(
+            frame,
+            width=28,
+            height=8,
+            wrap="word",
+            bg="#11151c",
+            fg=FG_MAIN,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#27303d",
+            highlightcolor="#27303d",
+            state="disabled",
+        )
+        self.player_tracker_players_widget.grid(row=5, column=0, sticky="ew", pady=(4, 0))
+
+        tk.Label(frame, text="♠ Last 10 hands", font=self.fonts["small"], bg=BG_PANEL, fg=FG_MUTED).grid(row=6, column=0, sticky="w", pady=(10, 0))
+        cards_box = tk.Frame(frame, bg=BG_PANEL)
+        cards_box.grid(row=7, column=0, sticky="nsew", pady=(4, 0))
+        cards_box.columnconfigure(0, weight=1)
+        for row in range(10):
+            card = tk.Label(
+                cards_box,
+                text=f"H{row + 1}: -",
+                font=self.fonts["small"],
+                bg=BG_BUTTON,
+                fg=FG_MAIN,
+                anchor="w",
+                justify="left",
+                padx=8,
+                pady=6,
+                highlightthickness=1,
+                highlightbackground="#27303d",
+                highlightcolor="#27303d",
+            )
+            card.grid(row=row, column=0, sticky="ew", pady=(0 if row == 0 else 4, 0))
+            self.player_tracker_recent_cards.append(card)
+
+        self.player_tracker_tab_button = tk.Button(
+            shell,
+            text="▶\nS\nT\nA\nT\nS",
+            command=lambda: self._set_player_tracker_visibility(True),
+            font=self.fonts["small"],
+            relief="flat",
+            bg=BG_BUTTON,
+            fg=FG_MAIN,
+            activebackground="#3a4556",
+            activeforeground=FG_MAIN,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+
+    def _resize_window_for_tracker_visibility(self, visible: bool) -> None:
+        if self.state() != "normal":
+            return
+        if not self.winfo_exists():
+            return
+
+        delta = self._tracker_column_width - self._tracker_tab_width
+        if delta <= 0:
+            return
+
+        current_width = self.winfo_width()
+        current_height = self.winfo_height()
+        current_x = self.winfo_x()
+        current_y = self.winfo_y()
+
+        if visible:
+            target_width = current_width + delta
+            min_width = self._min_width_with_tracker
+        else:
+            target_width = max(self._min_width_without_tracker, current_width - delta)
+            min_width = self._min_width_without_tracker
+
+        self.minsize(min_width, 520)
+        self.geometry(f"{target_width}x{current_height}+{current_x}+{current_y}")
+
+    def _set_player_tracker_visibility(self, visible: bool, resize_window: bool = True) -> None:
+        if self._tracker_visible == visible:
+            return
+        self._tracker_visible = visible
+        if self.player_tracker_frame is not None:
+            if visible:
+                self.player_tracker_frame.grid(row=1, column=1, sticky="nsew")
+            else:
+                self.player_tracker_frame.grid_remove()
+        if self._shell_frame is not None:
+            self._shell_frame.columnconfigure(1, minsize=(self._tracker_column_width if visible else self._tracker_tab_width))
+        if self.player_tracker_tab_button is not None:
+            if visible:
+                self.player_tracker_tab_button.grid_remove()
+            else:
+                self.player_tracker_tab_button.grid(row=1, column=1, sticky="ns")
+        if self.player_tracker_toggle_button is not None:
+            self.player_tracker_toggle_button.configure(text=("Hide Stats" if visible else "Show Stats"))
+        if resize_window:
+            self._resize_window_for_tracker_visibility(visible)
+
+    def _toggle_player_tracker_visibility(self) -> None:
+        self._set_player_tracker_visibility(not self._tracker_visible)
+
+    def _init_player_tracker_db(self) -> None:
+        try:
+            self._player_tracker_db = sqlite3.connect(self._player_tracker_db_file)
+            cur = self._player_tracker_db.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS Players (
+                    player_id INTEGER PRIMARY KEY,
+                    screen_name TEXT,
+                    site TEXT NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS Hands (
+                    table_id TEXT NOT NULL,
+                    hand_id INTEGER PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    blinds INTEGER,
+                    button_seat INTEGER,
+                    flop TEXT,
+                    turn TEXT,
+                    river TEXT,
+                    final_pot INTEGER,
+                    rake INTEGER
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS HandPlayers (
+                    hand_id INTEGER NOT NULL,
+                    player_id INTEGER NOT NULL,
+                    seat INTEGER,
+                    position TEXT,
+                    starting_stack INTEGER,
+                    ending_stack INTEGER,
+                    hole_cards TEXT,
+                    amount_contributed INTEGER,
+                    amount_won INTEGER,
+                    is_winner INTEGER,
+                    PRIMARY KEY (hand_id, player_id),
+                    FOREIGN KEY (hand_id) REFERENCES Hands(hand_id),
+                    FOREIGN KEY (player_id) REFERENCES Players(player_id)
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS Actions (
+                    action_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    hand_id INTEGER NOT NULL,
+                    player_id INTEGER NOT NULL,
+                    street TEXT NOT NULL,
+                    action_order INTEGER NOT NULL,
+                    action_type TEXT NOT NULL,
+                    amount INTEGER,
+                    FOREIGN KEY (hand_id) REFERENCES Hands(hand_id),
+                    FOREIGN KEY (player_id) REFERENCES Players(player_id)
+                )
+                """
+            )
+            self._player_tracker_db.commit()
+        except sqlite3.Error as error:
+            self._player_tracker_db = None
+            self._append_server_log(f"[tracker] sqlite init failed: {error}")
+
+    def _new_session_id(self, table_id: str) -> str:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        hero = str(self._hero_user_id) if isinstance(self._hero_user_id, int) else "unknown"
+        return f"{table_id}:{hero}:{stamp}"
+
+    def _reset_session_tracking(self) -> None:
+        self._session_active = False
+        self._session_table_id = None
+        self._current_session_id = None
+        self._session_table_delta = 0
+        self._session_hands_buffer = []
+        self._active_hand_record = None
+        self._current_hand_player_deltas = {}
+        self._current_hand_player_contrib = {}
+        self._current_hand_player_won = {}
+
+    def _finalize_session_to_db(self) -> None:
+        if self._player_tracker_db is None:
+            self._reset_session_tracking()
+            return
+        if not self._session_hands_buffer:
+            self._reset_session_tracking()
+            return
+
+        cur = self._player_tracker_db.cursor()
+        try:
+            for hand in self._session_hands_buffer:
+                hand_id = hand.get("hand_id")
+                if not isinstance(hand_id, int):
+                    continue
+                table_id = str(hand.get("table_id") or self._tracker_table_id())
+                session_id = str(hand.get("session_id") or self._current_session_id or "session")
+                cur.execute(
+                    """
+                    INSERT OR REPLACE INTO Hands
+                    (hand_id, table_id, session_id, timestamp, blinds, button_seat, flop, turn, river, final_pot, rake)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        hand_id,
+                        table_id,
+                        session_id,
+                        str(hand.get("timestamp") or datetime.now(timezone.utc).isoformat(timespec="seconds")),
+                        hand.get("blinds"),
+                        hand.get("button_seat"),
+                        hand.get("flop"),
+                        hand.get("turn"),
+                        hand.get("river"),
+                        hand.get("final_pot"),
+                        hand.get("rake"),
+                    ),
+                )
+
+                players = hand.get("players")
+                if isinstance(players, dict):
+                    for player_id, pdata in players.items():
+                        if not isinstance(player_id, int) or not isinstance(pdata, dict):
+                            continue
+                        screen_name = self._player_screen_names.get(player_id) or f"U{player_id}"
+                        cur.execute(
+                            """
+                            INSERT OR REPLACE INTO Players (player_id, screen_name, site)
+                            VALUES (?, ?, ?)
+                            """,
+                            (player_id, screen_name, "ReplayPoker"),
+                        )
+                        cur.execute(
+                            """
+                            INSERT OR REPLACE INTO HandPlayers
+                            (hand_id, player_id, seat, position, starting_stack, ending_stack, hole_cards, amount_contributed, amount_won, is_winner)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                hand_id,
+                                player_id,
+                                pdata.get("seat"),
+                                pdata.get("position"),
+                                pdata.get("starting_stack"),
+                                pdata.get("ending_stack"),
+                                pdata.get("hole_cards"),
+                                pdata.get("amount_contributed", 0),
+                                pdata.get("amount_won", 0),
+                                1 if pdata.get("is_winner") else 0,
+                            ),
+                        )
+
+                actions = hand.get("actions")
+                if isinstance(actions, list):
+                    for action in actions:
+                        if not isinstance(action, dict):
+                            continue
+                        player_id = action.get("player_id")
+                        if not isinstance(player_id, int):
+                            continue
+                        cur.execute(
+                            """
+                            INSERT INTO Actions (hand_id, player_id, street, action_order, action_type, amount)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                hand_id,
+                                player_id,
+                                str(action.get("street") or "Preflop"),
+                                int(action.get("action_order") or 0),
+                                str(action.get("action_type") or "Check"),
+                                action.get("amount"),
+                            ),
+                        )
+            self._player_tracker_db.commit()
+        except sqlite3.Error as error:
+            self._append_server_log(f"[tracker] session commit failed: {error}")
+            self._player_tracker_db.rollback()
+        self._reset_session_tracking()
+
+    def _tracker_table_id(self) -> str:
+        return self._current_table_id or "unknown"
+
+    def _set_tracker_table_id(self, table_id: object) -> None:
+        previous = self._current_table_id
+        if isinstance(table_id, int):
+            self._current_table_id = str(table_id)
+        elif isinstance(table_id, str) and table_id.strip():
+            self._current_table_id = table_id.strip()
+        if previous and self._current_table_id and previous != self._current_table_id and self._session_active:
+            self._finalize_session_to_db()
+
+    def _update_seat_user_map(self, seats: object) -> None:
+        if not isinstance(seats, list):
+            return
+        for seat in seats:
+            if not isinstance(seat, dict):
+                continue
+            seat_id = seat.get("id")
+            if not isinstance(seat_id, int):
+                continue
+            user_id = self._extract_player_user_id(seat)
+            if user_id is not None:
+                self._seat_user_map[seat_id] = user_id
+                screen_name = seat.get("screenName") or seat.get("name") or seat.get("username")
+                if isinstance(screen_name, str) and screen_name.strip():
+                    self._player_screen_names[user_id] = screen_name.strip()
+            if self._player_matches_hero_name(seat):
+                allow_bind = False
+                if self._hero_user_id is None and self._hero_seat_id is None:
+                    allow_bind = True
+                elif self._hero_user_id is not None and user_id == self._hero_user_id:
+                    allow_bind = True
+                elif self._hero_seat_id is not None and seat_id == self._hero_seat_id:
+                    allow_bind = True
+                if allow_bind:
+                    self._hero_seat_id = seat_id
+                    if user_id is not None:
+                        self._hero_user_id = user_id
+                    self._hero_sitting_out = self._player_is_sitting_out(seat)
+
+    def _update_stack_snapshots(self, seats: object) -> None:
+        if not isinstance(seats, list):
+            return
+        for seat in seats:
+            if not isinstance(seat, dict):
+                continue
+            user_id = self._extract_player_user_id(seat)
+            stack = seat.get("stack")
+            if user_id is None or not isinstance(stack, int):
+                continue
+            self._current_hand_player_stacks[user_id] = stack
+            if isinstance(self._active_hand_record, dict):
+                players = self._active_hand_record.setdefault("players", {})
+                pdata = players.setdefault(
+                    user_id,
+                    {
+                        "seat": None,
+                        "position": None,
+                        "starting_stack": None,
+                        "ending_stack": None,
+                        "hole_cards": None,
+                        "amount_contributed": 0,
+                        "amount_won": 0,
+                        "is_winner": False,
+                    },
+                )
+                seat_id = seat.get("id")
+                if isinstance(seat_id, int):
+                    pdata["seat"] = seat_id
+                if pdata.get("starting_stack") is None:
+                    pdata["starting_stack"] = stack
+                pdata["ending_stack"] = stack
+
+    def _accumulate_awardpot_deltas(self, update: dict[str, object]) -> None:
+        pot = update.get("pot")
+        if not isinstance(pot, dict):
+            return
+        pot_players = pot.get("players")
+        if not isinstance(pot_players, list):
+            return
+        for pot_player in pot_players:
+            if not isinstance(pot_player, dict):
+                continue
+            seat_id = pot_player.get("seatId")
+            if not isinstance(seat_id, int):
+                continue
+            user_id = self._seat_user_map.get(seat_id)
+            if user_id is None:
+                continue
+            contribution = pot_player.get("contribution")
+            winnings = pot_player.get("winnings")
+            contribution_int = int(contribution) if isinstance(contribution, int) else 0
+            winnings_int = int(winnings) if isinstance(winnings, int) else 0
+            delta = winnings_int - contribution_int
+            self._current_hand_player_deltas[user_id] = self._current_hand_player_deltas.get(user_id, 0) + delta
+            self._current_hand_player_contrib[user_id] = self._current_hand_player_contrib.get(user_id, 0) + contribution_int
+            self._current_hand_player_won[user_id] = self._current_hand_player_won.get(user_id, 0) + winnings_int
+
+    def _ensure_active_hand(self, update: dict[str, object]) -> None:
+        if not self._session_active:
+            return
+        hand_id_value = update.get("handId")
+        if not isinstance(hand_id_value, int):
+            return
+        if isinstance(self._active_hand_record, dict) and self._active_hand_record.get("hand_id") == hand_id_value:
+            return
+        self._active_hand_record = {
+            "hand_id": hand_id_value,
+            "table_id": self._tracker_table_id(),
+            "session_id": self._current_session_id or self._new_session_id(self._tracker_table_id()),
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "blinds": None,
+            "button_seat": update.get("dealerSeat") if isinstance(update.get("dealerSeat"), int) else None,
+            "flop": None,
+            "turn": None,
+            "river": None,
+            "final_pot": None,
+            "rake": None,
+            "players": {},
+            "actions": [],
+            "action_order": 0,
+        }
+        self._current_hand_player_deltas = {}
+        self._current_hand_player_contrib = {}
+        self._current_hand_player_won = {}
+
+    def _start_session_if_needed(self, seats: object) -> None:
+        if self._hero_user_id is None:
+            return
+        if not isinstance(seats, list):
+            return
+        hero_seat = None
+        for seat in seats:
+            if not isinstance(seat, dict):
+                continue
+            if self._extract_player_user_id(seat) != self._hero_user_id:
+                continue
+            hero_seat = seat
+            break
+        if hero_seat is None:
+            return
+        if self._player_is_sitting_out(hero_seat):
+            return
+
+        table_id = self._tracker_table_id()
+        if not self._session_active or self._session_table_id != table_id:
+            if self._session_active:
+                self._finalize_session_to_db()
+            self._session_active = True
+            self._session_table_id = table_id
+            self._current_session_id = self._new_session_id(table_id)
+            self._session_table_delta = 0
+            self._session_hands_buffer = []
+            self._active_hand_record = None
+
+    def _record_action_event(self, player_id: int, action_type: str, amount: int | None = None, street: str | None = None) -> None:
+        if not isinstance(self._active_hand_record, dict):
+            return
+        self._active_hand_record["action_order"] = int(self._active_hand_record.get("action_order", 0)) + 1
+        entry = {
+            "player_id": player_id,
+            "street": street or self._street.title(),
+            "action_order": self._active_hand_record["action_order"],
+            "action_type": action_type,
+            "amount": amount,
+        }
+        actions = self._active_hand_record.setdefault("actions", [])
+        if isinstance(actions, list):
+            actions.append(entry)
+
+    def _action_type_label(self, action_lower: str) -> str:
+        mapping = {
+            "fold": "Fold",
+            "check": "Check",
+            "call": "Call",
+            "bet": "Bet",
+            "raise": "Raise",
+            "allin": "All-In",
+        }
+        return mapping.get(action_lower, action_lower.title())
+
+    def _resume_after_new_hole_if_ready(self) -> None:
+        # Fold pause should only survive until a fresh 2-card hero hand is present.
+        if self._hero_folded_waiting_for_new_hole and len(self.selected) == 2:
+            self._hero_folded_waiting_for_new_hole = False
+
+    def _record_blind_actions(self, update: dict[str, object]) -> None:
+        players = update.get("players")
+        if not isinstance(players, list):
+            return
+        for player in players:
+            if not isinstance(player, dict):
+                continue
+            seat_id = player.get("seatId")
+            if not isinstance(seat_id, int):
+                continue
+            player_id = self._seat_user_map.get(seat_id)
+            if player_id is None:
+                continue
+            amount = player.get("bet")
+            amount_int = int(amount) if isinstance(amount, int) else None
+            self._record_action_event(player_id, "Post Blind", amount_int, "Preflop")
+
+    def _hero_stood_up(self, update: dict[str, object]) -> bool:
+        if not self._session_active or self._hero_user_id is None:
+            return False
+
+        seats = update.get("seats")
+        if isinstance(seats, list):
+            hero_found = False
+            for seat in seats:
+                if not isinstance(seat, dict):
+                    continue
+                if self._extract_player_user_id(seat) != self._hero_user_id:
+                    continue
+                hero_found = True
+                state = str(seat.get("state", "")).lower()
+                if state in {"available", "reserved"}:
+                    return True
+            if not hero_found:
+                return True
+
+        action = str(update.get("action", "")).lower()
+        if action == "seat":
+            seat = update.get("seat")
+            if isinstance(seat, dict):
+                state = str(seat.get("state", "")).lower()
+                seat_user = self._extract_player_user_id(seat)
+                if seat_user == self._hero_user_id and state in {"available", "reserved"}:
+                    return True
+        return False
+
+    def _flush_hand_tracker(self) -> None:
+        if not isinstance(self._active_hand_record, dict):
+            return
+        if self._current_hand_id is None:
+            self._active_hand_record = None
+            return
+        record = self._active_hand_record
+        record["final_pot"] = self._pot_chips if isinstance(self._pot_chips, int) else record.get("final_pot")
+
+        players = record.setdefault("players", {})
+        if isinstance(players, dict):
+            for user_id, delta in self._current_hand_player_deltas.items():
+                pdata = players.setdefault(
+                    user_id,
+                    {
+                        "seat": None,
+                        "position": None,
+                        "starting_stack": None,
+                        "ending_stack": self._current_hand_player_stacks.get(user_id),
+                        "hole_cards": None,
+                        "amount_contributed": 0,
+                        "amount_won": 0,
+                        "is_winner": False,
+                    },
+                )
+                pdata["amount_contributed"] = self._current_hand_player_contrib.get(user_id, 0)
+                pdata["amount_won"] = self._current_hand_player_won.get(user_id, 0)
+                pdata["is_winner"] = self._current_hand_player_won.get(user_id, 0) > 0
+                if pdata.get("ending_stack") is None:
+                    pdata["ending_stack"] = self._current_hand_player_stacks.get(user_id)
+
+        if isinstance(self._hero_user_id, int) and len(self.selected) == 2 and isinstance(players, dict):
+            hero = players.setdefault(
+                self._hero_user_id,
+                {
+                    "seat": self._hero_seat_id,
+                    "position": None,
+                    "starting_stack": self._hero_hand_start_stack,
+                    "ending_stack": self._hero_hand_end_stack,
+                    "hole_cards": None,
+                    "amount_contributed": self._current_hand_player_contrib.get(self._hero_user_id, 0),
+                    "amount_won": self._current_hand_player_won.get(self._hero_user_id, 0),
+                    "is_winner": self._current_hand_player_won.get(self._hero_user_id, 0) > 0,
+                },
+            )
+            hero["hole_cards"] = " ".join(card.code for card in self.selected)
+
+        self._session_hands_buffer.append(record)
+        if isinstance(self._hero_user_id, int):
+            hero_delta = self._current_hand_player_deltas.get(self._hero_user_id, 0)
+            self._session_table_delta += hero_delta
+            record["hero_delta"] = hero_delta
+
+        self._active_hand_record = None
+        self._current_hand_player_deltas = {}
+        self._current_hand_player_contrib = {}
+        self._current_hand_player_won = {}
+
+    def _refresh_player_tracker_panel(self) -> None:
+        table_id = self._tracker_table_id()
+        self.player_tracker_table_var.set(f"⌂ Current table: {table_id}")
+
+        if self._player_tracker_db is None:
+            self.player_tracker_total_var.set("♦ Total winnings: DB offline")
+            self.player_tracker_from_table_var.set("◇ From this table: -")
+            return
+
+        hero_total = 0
+        if isinstance(self._hero_user_id, int):
+            row = self._player_tracker_db.execute(
+                """
+                SELECT COALESCE(SUM(COALESCE(amount_won,0) - COALESCE(amount_contributed,0)), 0)
+                FROM HandPlayers
+                WHERE player_id=?
+                """,
+                (self._hero_user_id,),
+            ).fetchone()
+            if row is not None:
+                hero_total = int(row[0])
+
+        sign = "+" if hero_total >= 0 else ""
+        self.player_tracker_total_var.set(f"♦ Total winnings: {sign}{hero_total}")
+
+        from_table_value = self._session_table_delta if self._session_active and self._session_table_id == table_id else 0
+        from_table_sign = "+" if from_table_value >= 0 else ""
+        self.player_tracker_from_table_var.set(f"◇ From this table: {from_table_sign}{from_table_value}")
+
+        if self.player_tracker_players_widget is not None:
+            lines = []
+            for user_id, stack in sorted(self._current_hand_player_stacks.items(), key=lambda item: item[0]):
+                lines.append(f"U{user_id}  stack {stack}")
+            if not lines:
+                lines = ["Waiting for table seat/stack data..."]
+            self.player_tracker_players_widget.configure(state="normal")
+            self.player_tracker_players_widget.delete("1.0", tk.END)
+            self.player_tracker_players_widget.insert(tk.END, "\n".join(lines))
+            self.player_tracker_players_widget.configure(state="disabled")
+
+        recent: list[str] = []
+        for hand in reversed(self._session_hands_buffer[-10:]):
+            hand_id = hand.get("hand_id")
+            hero_delta = hand.get("hero_delta", 0)
+            if isinstance(hand_id, int):
+                delta_int = int(hero_delta) if isinstance(hero_delta, int) else 0
+                sign_delta = "+" if delta_int >= 0 else ""
+                recent.append(f"H{hand_id}: Hero {sign_delta}{delta_int}")
+
+        if len(recent) < 10:
+            recent_rows = self._player_tracker_db.execute(
+                """
+                SELECT h.hand_id,
+                       COALESCE(hp.amount_won, 0) - COALESCE(hp.amount_contributed, 0) AS hero_delta
+                FROM Hands h
+                LEFT JOIN HandPlayers hp
+                  ON hp.hand_id = h.hand_id
+                 AND hp.player_id = ?
+                WHERE h.table_id = ?
+                ORDER BY h.timestamp DESC
+                LIMIT ?
+                """,
+                (self._hero_user_id or -1, table_id, max(0, 10 - len(recent))),
+            ).fetchall()
+            for hand_id, hero_delta in recent_rows:
+                if isinstance(hand_id, int):
+                    delta_int = int(hero_delta or 0)
+                    sign_delta = "+" if delta_int >= 0 else ""
+                    recent.append(f"H{hand_id}: Hero {sign_delta}{delta_int}")
+
+        for idx, card in enumerate(self.player_tracker_recent_cards):
+            if idx < len(recent):
+                card.configure(text=f"▣ {recent[idx]}")
+            else:
+                card.configure(text=f"H{idx + 1}: -")
 
     def _build_server_column(self, root: tk.Frame) -> None:
         frame = tk.Frame(root, bg=BG_PANEL, padx=10, pady=10, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1)
@@ -429,7 +1174,7 @@ class PreflopApp(tk.Tk):
 
     def _build_strategy_column(self, root: tk.Frame) -> None:
         frame = tk.Frame(root, bg=BG_PANEL, padx=10, pady=10, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1)
-        frame.grid(row=2, column=2, sticky="nsew")
+        frame.grid(row=0, column=1, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(5, weight=1)
         self.strategy_frame = frame
@@ -892,6 +1637,33 @@ class PreflopApp(tk.Tk):
                     return int(trimmed_nested)
         return None
 
+    def _hero_name(self) -> str:
+        return self.hero_name_var.get().strip().lower()
+
+    def _extract_player_name(self, player: object) -> str | None:
+        if not isinstance(player, dict):
+            return None
+        for key in ("screenName", "name", "username"):
+            value = player.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        user = player.get("user")
+        if isinstance(user, dict):
+            for key in ("screenName", "name", "username", "login"):
+                value = user.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return None
+
+    def _player_matches_hero_name(self, player: object) -> bool:
+        hero_name = self._hero_name()
+        if not hero_name:
+            return False
+        player_name = self._extract_player_name(player)
+        if not isinstance(player_name, str):
+            return False
+        return player_name.strip().lower() == hero_name
+
     def _player_is_sitting_out(self, player: object) -> bool:
         if not isinstance(player, dict):
             return False
@@ -1005,6 +1777,10 @@ class PreflopApp(tk.Tk):
         return max(2, min(10, active))
 
     def _update_strategy_from_update(self, update: dict[str, object]) -> None:
+        seats = update.get("seats")
+        self._update_seat_user_map(seats)
+        self._update_stack_snapshots(seats)
+
         hand_id_value = update.get("handId")
         if isinstance(hand_id_value, int):
             self._current_hand_id = hand_id_value
@@ -1018,6 +1794,8 @@ class PreflopApp(tk.Tk):
         if len(self._recent_actions) > 24:
             self._recent_actions = self._recent_actions[-24:]
 
+        self._ensure_active_hand(update)
+
         state_value = update.get("state")
         if isinstance(state_value, str):
             normalized = state_value.lower()
@@ -1026,6 +1804,8 @@ class PreflopApp(tk.Tk):
 
         if action_lower == "starthand":
             self._reset_hand_learning_state()
+            self._start_session_if_needed(update.get("seats"))
+            self._current_hand_player_deltas = {}
             update_hand_id = update.get("id")
             if isinstance(update_hand_id, int):
                 self._current_hand_id = update_hand_id
@@ -1037,28 +1817,37 @@ class PreflopApp(tk.Tk):
             self._street = "preflop"
             self._pot_chips = None
             self._to_call_chips = None
+            self._minimum_raise_chips = None
             self._recent_actions = []
             self._allin_pressure = False
+            self._hero_acted_preflop = False
             self._hero_sitting_out = None
             # Keep strategy/training paused until the new hand's hero hole cards arrive.
             self._hero_folded_waiting_for_new_hole = True
 
             seats = update.get("seats")
-            if isinstance(seats, list) and self._hero_user_id is not None:
+            if isinstance(seats, list):
                 for seat in seats:
                     if not isinstance(seat, dict):
                         continue
                     seat_user_id = self._extract_player_user_id(seat)
-                    if seat_user_id != self._hero_user_id:
+                    if self._hero_user_id is not None:
+                        if seat_user_id != self._hero_user_id:
+                            continue
+                    elif not self._player_matches_hero_name(seat):
                         continue
                     seat_id = seat.get("id")
                     if isinstance(seat_id, int):
                         self._hero_seat_id = seat_id
+                    if self._hero_user_id is None and seat_user_id is not None:
+                        self._hero_user_id = seat_user_id
                     stack_value = seat.get("stack")
                     if isinstance(stack_value, int):
                         self._hero_hand_start_stack = stack_value
                     self._hero_sitting_out = self._player_is_sitting_out(seat)
                     break
+
+                    self._ensure_active_hand(update)
 
         players = update.get("players")
         players_count = self._players_active_from_snapshot(players)
@@ -1071,11 +1860,18 @@ class PreflopApp(tk.Tk):
                 if not isinstance(player, dict):
                     continue
                 player_user_id = self._extract_player_user_id(player)
+                matched = False
                 if self._hero_user_id is not None and player_user_id == self._hero_user_id:
+                    matched = True
+                elif self._hero_user_id is None and self._player_matches_hero_name(player):
+                    matched = True
+                if matched:
                     hero_player = player
                     seat = player.get("seatId")
                     if isinstance(seat, int):
                         self._hero_seat_id = seat
+                    if self._hero_user_id is None and player_user_id is not None:
+                        self._hero_user_id = player_user_id
                     break
 
             if hero_player is None and self._hero_seat_id is not None:
@@ -1099,17 +1895,29 @@ class PreflopApp(tk.Tk):
                 seats=update.get("seats"),
             )
 
+        if action_lower == "blinds":
+            if isinstance(self._active_hand_record, dict):
+                minimum_raise = update.get("minimumRaise")
+                if isinstance(minimum_raise, int):
+                    self._active_hand_record["blinds"] = minimum_raise
+            self._record_blind_actions(update)
+
         seats_snapshot = update.get("seats")
-        if isinstance(seats_snapshot, list) and self._hero_user_id is not None:
+        if isinstance(seats_snapshot, list):
             for seat in seats_snapshot:
                 if not isinstance(seat, dict):
                     continue
                 seat_user_id = self._extract_player_user_id(seat)
-                if seat_user_id != self._hero_user_id:
+                if self._hero_user_id is not None:
+                    if seat_user_id != self._hero_user_id:
+                        continue
+                elif not self._player_matches_hero_name(seat):
                     continue
                 seat_id = seat.get("id")
                 if isinstance(seat_id, int):
                     self._hero_seat_id = seat_id
+                if self._hero_user_id is None and seat_user_id is not None:
+                    self._hero_user_id = seat_user_id
                 stack_value = seat.get("stack")
                 if isinstance(stack_value, int) and self._hero_hand_start_stack is None:
                     self._hero_hand_start_stack = stack_value
@@ -1137,10 +1945,13 @@ class PreflopApp(tk.Tk):
             self._allin_pressure = True
 
         minimum_raise = update.get("minimumRaise")
-        if isinstance(minimum_raise, int) and minimum_raise >= 0 and self._to_call_chips is None:
-            self._to_call_chips = minimum_raise
+        if isinstance(minimum_raise, int) and minimum_raise >= 0:
+            self._minimum_raise_chips = minimum_raise
+            if self._to_call_chips is None:
+                self._to_call_chips = minimum_raise
 
         if action_lower == "awardpot":
+            self._accumulate_awardpot_deltas(update)
             self._to_call_chips = 0
             self._allin_pressure = False
             players = update.get("players")
@@ -1198,9 +2009,24 @@ class PreflopApp(tk.Tk):
             cards = update.get("cards")
             if isinstance(cards, list):
                 self._write_strategy_training_event("community_reveal", cards=cards)
+                if isinstance(self._active_hand_record, dict):
+                    normalized = [str(card) for card in cards]
+                    if len(normalized) == 3:
+                        self._active_hand_record["flop"] = " ".join(normalized)
+                    elif len(normalized) == 1:
+                        if not self._active_hand_record.get("turn"):
+                            self._active_hand_record["turn"] = normalized[0]
+                        else:
+                            self._active_hand_record["river"] = normalized[0]
 
         if action_lower in {"fold", "check", "call", "bet", "raise", "allin"}:
             seat_id = update.get("seatId")
+            if isinstance(seat_id, int):
+                actor_user_id = self._seat_user_map.get(seat_id)
+                if actor_user_id is not None:
+                    chips = update.get("chips")
+                    amount = int(chips) if isinstance(chips, int) else None
+                    self._record_action_event(actor_user_id, self._action_type_label(action_lower), amount, self._street.title())
             if self._hero_sitting_out is not True and self._hero_seat_id is not None and isinstance(seat_id, int) and seat_id == self._hero_seat_id:
                 self._write_strategy_training_event(
                     "hero_action",
@@ -1208,10 +2034,13 @@ class PreflopApp(tk.Tk):
                     chips=update.get("chips"),
                     minimum_raise=update.get("minimumRaise"),
                 )
+                if self._street == "preflop":
+                    self._hero_acted_preflop = True
                 if action_lower == "fold":
                     self._hero_folded_waiting_for_new_hole = True
 
         if action_lower == "finishhand":
+            self._flush_hand_tracker()
             seats = update.get("seats")
             if isinstance(seats, list) and self._hero_seat_id is not None:
                 for seat in seats:
@@ -1247,6 +2076,11 @@ class PreflopApp(tk.Tk):
                     finished_at=update.get("finishedAt"),
                 )
 
+                if self._hero_stood_up(update):
+                    self._finalize_session_to_db()
+
+        self._refresh_player_tracker_panel()
+
     def _update_strategy_from_console_line(self, line: str) -> None:
         if not line.startswith("[RAW_CONSOLE]"):
             return
@@ -1264,6 +2098,7 @@ class PreflopApp(tk.Tk):
 
         payload_user = payload.get("userId")
         payload_table = payload.get("tableId")
+        self._set_tracker_table_id(payload_table)
         if self._hero_user_id is None and isinstance(payload_table, int):
             if isinstance(payload_user, int):
                 self._hero_user_id = payload_user
@@ -1279,9 +2114,12 @@ class PreflopApp(tk.Tk):
             self._update_strategy_from_update(payload)
 
         self._update_strategy_panel()
+        self._refresh_player_tracker_panel()
         self._log_app_action("strategy_line_processed")
 
     def _update_strategy_panel(self) -> None:
+        self._resume_after_new_hole_if_ready()
+
         street = self._street_label()
         pot_text = str(self._pot_chips) if isinstance(self._pot_chips, int) else "-"
         to_call_text = str(self._to_call_chips) if isinstance(self._to_call_chips, int) else "-"
@@ -1357,13 +2195,22 @@ class PreflopApp(tk.Tk):
         overbet_pressure = pot > 0 and to_call >= max(1, pot)
         large_bet_pressure = pot > 0 and to_call >= max(1, int(pot * 0.6))
         weak_action = aggression == "Low" and to_call == 0
-        preflop_allin_pressure = self._street == "preflop" and (self._allin_pressure or overbet_pressure or large_bet_pressure)
+        min_raise = self._minimum_raise_chips if isinstance(self._minimum_raise_chips, int) and self._minimum_raise_chips > 0 else 2
+        preflop_shove_threshold = max(12, min_raise * 8)
+        preflop_allin_pressure = self._street == "preflop" and (
+            self._allin_pressure
+            or to_call >= preflop_shove_threshold
+            or (to_call >= max(1, pot) and pot >= preflop_shove_threshold // 2)
+        )
 
         headline = "PLAY SOLID."
         details: list[str] = []
 
         if self._street == "preflop":
-            if preflop_allin_pressure and to_call > 0:
+            if self._hero_acted_preflop and to_call == 0:
+                headline = "PRE-FLOP DECISION MADE. WAIT FOR FLOP."
+                details.append("You already acted preflop and there is no new price to call. Let the flop arrive before changing plans.")
+            elif preflop_allin_pressure and to_call > 0:
                 if preflop.score >= 82:
                     headline = "PREFLOP SHOVE DETECTED. CALL OR RE-JAM."
                     details.append("This is strong enough to continue against most all-in ranges.")
@@ -1551,6 +2398,8 @@ class PreflopApp(tk.Tk):
             self._update_strategy_panel()
             return
 
+        accepting_fresh_hole = self._hero_folded_waiting_for_new_hole or self._awaiting_hero_hole_after_reset
+
         self._log_app_action(
             "apply_external_cards_start",
             hole_cards=hole_cards,
@@ -1612,7 +2461,7 @@ class PreflopApp(tk.Tk):
             existing_hole_codes = [card.code for card in self.selected]
 
             # Keep hole cards immutable within a hand to prevent noisy payload overwrites.
-            if board_count > 0 and len(existing_hole_codes) == 2:
+            if board_count > 0 and len(existing_hole_codes) == 2 and not accepting_fresh_hole:
                 self._append_server_log("[bridge] ignored hole update after board started")
                 self._log_app_action(
                     "apply_external_cards_skip",
@@ -1621,7 +2470,7 @@ class PreflopApp(tk.Tk):
                     existing_hole=existing_hole_codes,
                 )
                 parsed_hole = []
-            elif len(existing_hole_codes) == 2 and incoming_hole_codes != existing_hole_codes:
+            elif len(existing_hole_codes) == 2 and incoming_hole_codes != existing_hole_codes and not accepting_fresh_hole:
                 self._append_server_log("[bridge] ignored conflicting hole overwrite before reset")
                 self._log_app_action(
                     "apply_external_cards_skip",
@@ -1645,7 +2494,7 @@ class PreflopApp(tk.Tk):
             self.selected = parsed_hole
             self._awaiting_hero_hole_after_reset = False
             self._hero_sitting_out = False
-            self._hero_folded_waiting_for_new_hole = False
+            self._resume_after_new_hole_if_ready()
         hole_changed = bool(parsed_hole) and [card.code for card in self.selected] != previous_hole_codes
 
         if board_cards is not None:
@@ -1708,6 +2557,12 @@ class PreflopApp(tk.Tk):
                 pass
             self._server_poll_job = None
         self._stop_server()
+        if self._player_tracker_db is not None:
+            try:
+                self._player_tracker_db.close()
+            except sqlite3.Error:
+                pass
+            self._player_tracker_db = None
         super().destroy()
 
     def _build_title_bar(self, parent: tk.Frame) -> None:
@@ -1726,8 +2581,50 @@ class PreflopApp(tk.Tk):
         )
         title.grid(row=0, column=0, sticky="w")
 
+        identity = tk.Frame(bar, bg=BG_PANEL)
+        identity.grid(row=0, column=1, sticky="e", padx=(6, 10))
+        self.hero_name_label = tk.Label(
+            identity,
+            text="Player:",
+            font=self.fonts["small"],
+            bg=BG_PANEL,
+            fg=FG_MUTED,
+        )
+        self.hero_name_label.grid(row=0, column=0, padx=(0, 4), pady=1)
+        self.hero_name_entry = tk.Entry(
+            identity,
+            textvariable=self.hero_name_var,
+            width=12,
+            font=self.fonts["small"],
+            bg="#0f141b",
+            fg=FG_MAIN,
+            insertbackground=FG_MAIN,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#2b3442",
+            highlightcolor="#4d6280",
+        )
+        self.hero_name_entry.grid(row=0, column=1, padx=(0, 0), pady=1)
+
         buttons = tk.Frame(bar, bg=BG_PANEL)
-        buttons.grid(row=0, column=1, sticky="e")
+        buttons.grid(row=0, column=2, sticky="e")
+
+        self.player_tracker_toggle_button = tk.Button(
+            buttons,
+            text="Hide Stats",
+            font=self.fonts["small"],
+            width=10,
+            command=self._toggle_player_tracker_visibility,
+            relief="flat",
+            bg=BG_PANEL,
+            fg=FG_MAIN,
+            activebackground="#3a4556",
+            activeforeground=FG_MAIN,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.player_tracker_toggle_button.grid(row=0, column=0, padx=(0, 4), pady=1)
 
         tk.Button(
             buttons,
@@ -1743,7 +2640,7 @@ class PreflopApp(tk.Tk):
             highlightthickness=0,
             bd=0,
             cursor="hand2",
-        ).grid(row=0, column=0, padx=(0, 1), pady=1)
+        ).grid(row=0, column=1, padx=(0, 1), pady=1)
 
         self.maximize_button = tk.Button(
             buttons,
@@ -1760,7 +2657,7 @@ class PreflopApp(tk.Tk):
             bd=0,
             cursor="hand2",
         )
-        self.maximize_button.grid(row=0, column=1, padx=1, pady=1)
+        self.maximize_button.grid(row=0, column=2, padx=1, pady=1)
 
         tk.Button(
             buttons,
@@ -1776,7 +2673,7 @@ class PreflopApp(tk.Tk):
             highlightthickness=0,
             bd=0,
             cursor="hand2",
-        ).grid(row=0, column=2, padx=(1, 4), pady=1)
+        ).grid(row=0, column=3, padx=(1, 4), pady=1)
 
         draggable = (bar, title)
         for widget in draggable:
@@ -2162,10 +3059,13 @@ class PreflopApp(tk.Tk):
         if not self.winfo_exists() or self._is_minimized or self.state() == "iconic":
             return
         width = max(self.winfo_width(), 560)
+        content_width = width
+        if self._main_root_frame is not None and self._main_root_frame.winfo_width() > 1:
+            content_width = max(560, self._main_root_frame.winfo_width())
         height = max(self.winfo_height(), 520)
-        scale = min(width / 920, height / 660)
+        scale = min(content_width / 920, height / 660)
         scale = max(0.9, min(1.35, scale))
-        narrow = width < 760
+        narrow = content_width < 760
 
         for name, base in BASE_FONT_SIZES.items():
             self.fonts[name].configure(size=max(8, round(base * scale)))
@@ -2191,8 +3091,8 @@ class PreflopApp(tk.Tk):
             self.players_increase_button.configure(width=player_button_width, height=card_height)
 
         if self.subtitle_label is not None:
-            self.subtitle_label.configure(wraplength=max(260, width - 80))
-        panel_wrap = max(120, int((width - 84) / 3) - 20)
+            self.subtitle_label.configure(wraplength=max(260, content_width - 80))
+        panel_wrap = max(120, int((content_width - 84) / 3) - 20)
         text_wrap = max(120, min(250, panel_wrap))
         left_wrap = text_wrap
         right_wrap = text_wrap
@@ -2222,6 +3122,16 @@ class PreflopApp(tk.Tk):
             self.strategy_context_label.configure(wraplength=strategy_wrap)
         if self.strategy_advice_label is not None:
             self.strategy_advice_label.configure(wraplength=strategy_wrap)
+        if self.player_tracker_frame is not None and self.player_tracker_frame.winfo_width() > 1:
+            tracker_wrap = max(120, self.player_tracker_frame.winfo_width() - 28)
+            if self.player_tracker_total_label is not None:
+                self.player_tracker_total_label.configure(wraplength=tracker_wrap)
+            if self.player_tracker_from_table_label is not None:
+                self.player_tracker_from_table_label.configure(wraplength=tracker_wrap)
+            if self.player_tracker_table_label is not None:
+                self.player_tracker_table_label.configure(wraplength=tracker_wrap)
+            for card in self.player_tracker_recent_cards:
+                card.configure(wraplength=tracker_wrap)
 
         self._reflow_layout(narrow)
 
@@ -2316,6 +3226,7 @@ class PreflopApp(tk.Tk):
         self.selected.append(card)
         self._refresh_buttons()
         self._refresh_hole_buttons()
+        self._resume_after_new_hole_if_ready()
         if len(self.selected) == 2 and self.active_board_slot is None:
             self.active_board_slot = self._next_open_board_slot()
         self._update_outputs()
