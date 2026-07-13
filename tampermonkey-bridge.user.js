@@ -854,3 +854,4 @@
     sendDebug('userscript loaded at ' + new Date().toISOString());
 })();
     
+// javascript sux

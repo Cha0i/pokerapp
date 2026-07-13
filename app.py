@@ -149,6 +149,8 @@ class PreflopApp(tk.Tk):
         self.strategy_frame: tk.Frame | None = None
         self.training_status_label: tk.Label | None = None
         self.strategy_context_label: tk.Label | None = None
+        self.strategy_quick_label: tk.Label | None = None
+        self.strategy_quick_sub_label: tk.Label | None = None
         self.strategy_advice_label: tk.Label | None = None
         self.odds_after_id: str | None = None
         self.hand_rank_after_id: str | None = None
@@ -173,6 +175,8 @@ class PreflopApp(tk.Tk):
         self._strategy_training_log_file = Path(__file__).resolve().parent / "strategy-training.log"
         self.strategy_context_var = tk.StringVar(value="Street: - | Pot: - | To call: - | Aggression: -")
         self.training_status_var = tk.StringVar(value="Training: paused (no hero hole cards)")
+        self.strategy_quick_var = tk.StringVar(value="WAIT")
+        self.strategy_quick_sub_var = tk.StringVar(value="No hole cards")
         self.strategy_advice_var = tk.StringVar(
             value=(
                 "Smart play coach active. Start the bridge to read live bets and action flow. "
@@ -197,6 +201,7 @@ class PreflopApp(tk.Tk):
         self._hero_hand_end_stack: int | None = None
         self._saw_showdown_this_hand = False
         self._awaiting_hero_hole_after_reset = False
+        self._hero_folded_waiting_for_new_hole = False
         self._decision_advice_locks: dict[str, dict[str, str]] = {}
 
         self.board_cards: dict[str, Card | None] = {
@@ -426,10 +431,10 @@ class PreflopApp(tk.Tk):
         frame = tk.Frame(root, bg=BG_PANEL, padx=10, pady=10, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1)
         frame.grid(row=2, column=2, sticky="nsew")
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(3, weight=1)
+        frame.rowconfigure(5, weight=1)
         self.strategy_frame = frame
 
-        tk.Label(frame, text="Smart Play Coach", font=self.fonts["section"], bg=BG_PANEL, fg=FG_MAIN).grid(row=0, column=0, sticky="w")
+        tk.Label(frame, text="Play Coach", font=self.fonts["section"], bg=BG_PANEL, fg=FG_MAIN).grid(row=0, column=0, sticky="w")
         self.training_status_label = tk.Label(
             frame,
             textvariable=self.training_status_var,
@@ -452,6 +457,28 @@ class PreflopApp(tk.Tk):
             wraplength=280,
         )
         self.strategy_context_label.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.strategy_quick_label = tk.Label(
+            frame,
+            textvariable=self.strategy_quick_var,
+            font=self.fonts["label_large"],
+            bg=BG_PANEL,
+            fg=FG_MUTED,
+            justify="left",
+            anchor="w",
+            wraplength=280,
+        )
+        self.strategy_quick_label.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        self.strategy_quick_sub_label = tk.Label(
+            frame,
+            textvariable=self.strategy_quick_sub_var,
+            font=self.fonts["label_large"],
+            bg=BG_PANEL,
+            fg=FG_MUTED,
+            justify="left",
+            anchor="w",
+            wraplength=280,
+        )
+        self.strategy_quick_sub_label.grid(row=4, column=0, sticky="ew", pady=(2, 0))
         self.strategy_advice_label = tk.Label(
             frame,
             textvariable=self.strategy_advice_var,
@@ -462,7 +489,33 @@ class PreflopApp(tk.Tk):
             anchor="nw",
             wraplength=280,
         )
-        self.strategy_advice_label.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        self.strategy_advice_label.grid(row=5, column=0, sticky="nsew", pady=(10, 0))
+
+    def _strategy_quick_color(self, recommendation: str) -> str:
+        mapping = {
+            "fold": "#ff5f57",
+            "check": "#f59e0b",
+            "call": "#f59e0b",
+            "call_or_raise": "#2dc653",
+            "raise": "#2dc653",
+            "bet": "#2dc653",
+            "mixed": FG_MUTED,
+            "wait": FG_MUTED,
+        }
+        return mapping.get(recommendation, FG_MUTED)
+
+    def _strategy_quick_primary(self, recommendation: str) -> str:
+        mapping = {
+            "fold": "FOLD",
+            "check": "CHECK",
+            "call": "CALL",
+            "call_or_raise": "CALL / RAISE",
+            "raise": "RAISE",
+            "bet": "BET",
+            "mixed": "MIXED",
+            "wait": "WAIT",
+        }
+        return mapping.get(recommendation, "PLAY")
 
     def _clear_server_log(self) -> None:
         if self.server_log_widget is not None:
@@ -485,6 +538,8 @@ class PreflopApp(tk.Tk):
         if len(self.selected) < 2 and event in noisy_events_without_hole:
             return
         if self._hero_sitting_out is True and event in noisy_events_without_hole:
+            return
+        if self._hero_folded_waiting_for_new_hole and event in noisy_events_without_hole:
             return
         record = {
             "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
@@ -582,6 +637,8 @@ class PreflopApp(tk.Tk):
     def _write_strategy_training_event(self, event: str, **fields: object) -> None:
         if self._hero_sitting_out is True:
             return
+        if self._hero_folded_waiting_for_new_hole and event != "hole_set":
+            return
         if len(self.selected) < 2 and event != "hole_set":
             return
         record: dict[str, object] = {
@@ -610,6 +667,8 @@ class PreflopApp(tk.Tk):
 
     def _capture_advice_snapshot(self, trigger: str, force: bool = False) -> None:
         if self._hero_sitting_out is True:
+            return
+        if self._hero_folded_waiting_for_new_hole:
             return
         if len(self.selected) < 2:
             return
@@ -981,6 +1040,8 @@ class PreflopApp(tk.Tk):
             self._recent_actions = []
             self._allin_pressure = False
             self._hero_sitting_out = None
+            # Keep strategy/training paused until the new hand's hero hole cards arrive.
+            self._hero_folded_waiting_for_new_hole = True
 
             seats = update.get("seats")
             if isinstance(seats, list) and self._hero_user_id is not None:
@@ -1147,6 +1208,8 @@ class PreflopApp(tk.Tk):
                     chips=update.get("chips"),
                     minimum_raise=update.get("minimumRaise"),
                 )
+                if action_lower == "fold":
+                    self._hero_folded_waiting_for_new_hole = True
 
         if action_lower == "finishhand":
             seats = update.get("seats")
@@ -1230,14 +1293,43 @@ class PreflopApp(tk.Tk):
 
         if self._hero_sitting_out is True:
             self.training_status_var.set("Training: paused (hero sitting out)")
+            self.strategy_quick_var.set("PAUSED")
+            self.strategy_quick_sub_var.set("Sitting out")
+            color = self._strategy_quick_color("wait")
+            if self.strategy_quick_label is not None:
+                self.strategy_quick_label.configure(fg=color)
+            if self.strategy_quick_sub_label is not None:
+                self.strategy_quick_sub_label.configure(fg=color)
             self.strategy_advice_var.set(
                 "SITTING OUT. TRAINING PAUSED.\n"
                 "No strategy or training events are logged until you are back in a hand."
             )
             return
 
+        if self._hero_folded_waiting_for_new_hole:
+            self.training_status_var.set("Training: paused (hero folded, waiting new hole cards)")
+            self.strategy_quick_var.set("PAUSED")
+            self.strategy_quick_sub_var.set("Hero folded")
+            color = self._strategy_quick_color("wait")
+            if self.strategy_quick_label is not None:
+                self.strategy_quick_label.configure(fg=color)
+            if self.strategy_quick_sub_label is not None:
+                self.strategy_quick_sub_label.configure(fg=color)
+            self.strategy_advice_var.set(
+                "HERO FOLDED. TRACKING PAUSED.\n"
+                "No table-action strategy logging until your next hole cards arrive."
+            )
+            return
+
         if len(self.selected) < 2:
             self.training_status_var.set("Training: paused (no hero hole cards)")
+            self.strategy_quick_var.set("WAIT")
+            self.strategy_quick_sub_var.set("No hole cards")
+            color = self._strategy_quick_color("wait")
+            if self.strategy_quick_label is not None:
+                self.strategy_quick_label.configure(fg=color)
+            if self.strategy_quick_sub_label is not None:
+                self.strategy_quick_sub_label.configure(fg=color)
             self.strategy_advice_var.set(
                 "WAIT FOR HOLE CARDS.\n"
                 "No decision yet. Once your two cards arrive, the coach will give a direct action line first and short reasoning underneath."
@@ -1417,6 +1509,20 @@ class PreflopApp(tk.Tk):
                 "advice_text": advice_text,
             }
 
+        quick_primary = self._strategy_quick_primary(recommendation)
+        quick_secondary = (
+            f"EQ {self._format_percent(equity)} | ODDS {self._format_percent(pot_odds)}"
+            if equity is not None and pot_odds is not None and to_call > 0
+            else f"{street.upper()} | {players}P"
+        )
+        self.strategy_quick_var.set(quick_primary)
+        self.strategy_quick_sub_var.set(quick_secondary)
+        quick_color = self._strategy_quick_color(recommendation)
+        if self.strategy_quick_label is not None:
+            self.strategy_quick_label.configure(fg=quick_color)
+        if self.strategy_quick_sub_label is not None:
+            self.strategy_quick_sub_label.configure(fg=quick_color)
+
         self.strategy_advice_var.set(advice_text)
         self._capture_advice_snapshot("panel_update")
 
@@ -1441,6 +1547,10 @@ class PreflopApp(tk.Tk):
         hero_seat_id: int | None = None,
         hero_sitting_out: bool | None = None,
     ) -> None:
+        if self._hero_folded_waiting_for_new_hole and not hole_cards:
+            self._update_strategy_panel()
+            return
+
         self._log_app_action(
             "apply_external_cards_start",
             hole_cards=hole_cards,
@@ -1535,6 +1645,7 @@ class PreflopApp(tk.Tk):
             self.selected = parsed_hole
             self._awaiting_hero_hole_after_reset = False
             self._hero_sitting_out = False
+            self._hero_folded_waiting_for_new_hole = False
         hole_changed = bool(parsed_hole) and [card.code for card in self.selected] != previous_hole_codes
 
         if board_cards is not None:

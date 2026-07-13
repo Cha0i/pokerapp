@@ -9,7 +9,7 @@ This project is nearly completely generated with co-pilot.
 - Lets you set hero hole cards and community cards in a desktop UI.
 - Simulates win/tie/loss equity against a configurable number of players.
 - Shows hand-category distribution odds.
-- Opionally runs a local browser bridge server on https://casino.org/replay poker and automatically picks cards.s
+- Opionally runs a local browser bridge server on https://casino.org/replay poker and automatically picks cards, adjust player count and bets as the hand progresses to advice the player. 
 - Logs advice and outcomes for strategy review.
 
 ## Features
@@ -34,6 +34,7 @@ This project is nearly completely generated with co-pilot.
 - Python 3.10 or newer
 - pip
 - Tkinter available in your Python installation
+- If using the browser bridge, [Firefox](https://www.firefox.com) + - [Tampermonkey](https://addons.mozilla.org/en-US/firefox/addon/tampermonkey/) 
 
 ## Installation
 
@@ -70,7 +71,7 @@ python app.py
 
 ## Browser Bridge Setup (Tampermonkey)
 
-1. Install Tampermonkey in your browser.
+1. Install - [Tampermonkey](https://addons.mozilla.org/en-US/firefox/addon/tampermonkey/) for Firefox.
 2. Import `tampermonkey-bridge.user.js` as a new script.
 3. Launch the app and click **Start Server**.
 4. Confirm the userscript posts to `http://127.0.0.1:5000/log`.

@@ -77,7 +77,7 @@ HAND_CATEGORY_ORDER = [
     ("full_house", "Full house"),
     ("flush", "Flush"),
     ("straight", "Straight"),
-    ("three_kind", "3-of-a-Kind"),
+    ("three_kind", "3 of a Kind"),
     ("two_pair", "2 pair"),
     ("one_pair", "1 pair"),
     ("high_card", "High card"),
