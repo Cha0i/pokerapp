@@ -4,6 +4,7 @@ import json
 import re
 import sqlite3
 import threading
+import sys
 import tkinter as tk
 import tkinter.font as tkfont
 from datetime import datetime, timezone
@@ -11,8 +12,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from queue import Empty, Queue
 
-from flask import Flask, request
-from werkzeug.serving import make_server
+try:
+    from flask import Flask, request
+    from werkzeug.serving import make_server
+    _BRIDGE_DEPENDENCIES_AVAILABLE = True
+except ImportError:
+    Flask = None  # type: ignore[assignment]
+    request = None  # type: ignore[assignment]
+    make_server = None  # type: ignore[assignment]
+    _BRIDGE_DEPENDENCIES_AVAILABLE = False
 
 from handranker import (
     HAND_CATEGORY_ORDER,
@@ -242,6 +250,10 @@ class PreflopApp(tk.Tk):
         self._awaiting_hero_hole_after_reset = False
         self._hero_folded_waiting_for_new_hole = False
         self._decision_advice_locks: dict[str, dict[str, str]] = {}
+        self._seen_update_keys: set[tuple[int, int, str]] = set()
+        self._seen_update_order: list[tuple[int, int, str]] = []
+        self._seen_update_limit = 4000
+        self._bridge_available = _BRIDGE_DEPENDENCIES_AVAILABLE
 
         self.board_cards: dict[str, Card | None] = {
             "flop_1": None,
@@ -261,6 +273,9 @@ class PreflopApp(tk.Tk):
         self._refresh_board_buttons()
         self._apply_scale()
         self._schedule_server_poll()
+        if not self._bridge_available:
+            self.server_status_var.set("Bridge: unavailable (install Flask and Werkzeug)")
+            self.server_info_var.set("Core app will run without the browser bridge.")
         self.after(120, self._ensure_window_visible)
 
     def _ensure_window_visible(self) -> None:
@@ -1462,7 +1477,15 @@ class PreflopApp(tk.Tk):
     def _start_server(self) -> None:
         if self._server_running:
             return
+        if not self._bridge_available:
+            self._set_server_status("Bridge: unavailable (install Flask and Werkzeug)", False)
+            self.server_info_var.set("Core app will run without the browser bridge.")
+            self._append_server_log("[bridge] startup skipped: Flask/Werkzeug not installed")
+            return
 
+        assert Flask is not None
+        assert request is not None
+        assert make_server is not None
         app = Flask("pokerodds_bridge")
         incoming = self._incoming_logs
 
@@ -1776,6 +1799,23 @@ class PreflopApp(tk.Tk):
             active = len(players)
         return max(2, min(10, active))
 
+    def _is_duplicate_update(self, update: dict[str, object], action_lower: str) -> bool:
+        sequence = update.get("sequence")
+        if not isinstance(sequence, int):
+            return False
+        hand_id = update.get("handId")
+        if not isinstance(hand_id, int):
+            hand_id = self._current_hand_id if isinstance(self._current_hand_id, int) else -1
+        key = (hand_id, sequence, action_lower)
+        if key in self._seen_update_keys:
+            return True
+        self._seen_update_keys.add(key)
+        self._seen_update_order.append(key)
+        if len(self._seen_update_order) > self._seen_update_limit:
+            old_key = self._seen_update_order.pop(0)
+            self._seen_update_keys.discard(old_key)
+        return False
+
     def _update_strategy_from_update(self, update: dict[str, object]) -> None:
         seats = update.get("seats")
         self._update_seat_user_map(seats)
@@ -1790,6 +1830,14 @@ class PreflopApp(tk.Tk):
             return
 
         action_lower = action.lower()
+        if self._is_duplicate_update(update, action_lower):
+            self._log_app_action(
+                "strategy_update_deduped",
+                hand_id=update.get("handId"),
+                sequence=update.get("sequence"),
+                action=action_lower,
+            )
+            return
         self._recent_actions.append(action_lower)
         if len(self._recent_actions) > 24:
             self._recent_actions = self._recent_actions[-24:]
@@ -2053,6 +2101,14 @@ class PreflopApp(tk.Tk):
                         self._hero_hand_end_stack = stack_value
                     break
 
+            if isinstance(self._hero_user_id, int):
+                award = self._current_hand_player_won.get(self._hero_user_id)
+                contributed = self._current_hand_player_contrib.get(self._hero_user_id)
+                if isinstance(award, int) or isinstance(contributed, int):
+                    award_int = int(award) if isinstance(award, int) else 0
+                    contrib_int = int(contributed) if isinstance(contributed, int) else 0
+                    self._hand_hero_winnings = award_int - contrib_int
+
             if self._hand_hero_winnings is None and isinstance(self._hero_hand_start_stack, int) and isinstance(self._hero_hand_end_stack, int):
                 self._hand_hero_winnings = self._hero_hand_end_stack - self._hero_hand_start_stack
 
@@ -2109,6 +2165,12 @@ class PreflopApp(tk.Tk):
         if isinstance(updates, list):
             for update in updates:
                 if isinstance(update, dict):
+                    if "handId" not in update and isinstance(payload.get("handId"), int):
+                        update["handId"] = payload.get("handId")
+                    if "tableId" not in update and isinstance(payload.get("tableId"), int):
+                        update["tableId"] = payload.get("tableId")
+                    if "userId" not in update and isinstance(payload.get("userId"), int):
+                        update["userId"] = payload.get("userId")
                     self._update_strategy_from_update(update)
         elif isinstance(payload.get("action"), str):
             self._update_strategy_from_update(payload)
