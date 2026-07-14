@@ -22,6 +22,7 @@ except ImportError:
     make_server = None  # type: ignore[assignment]
     _BRIDGE_DEPENDENCIES_AVAILABLE = False
 
+from bridge_payloads import parse_bridge_payload
 from handranker import (
     HAND_CATEGORY_ORDER,
     RANKS_DESC,
@@ -1037,10 +1038,26 @@ class PreflopApp(tk.Tk):
                 },
             )
             hero["hole_cards"] = " ".join(card.code for card in self.selected)
+            if hero.get("starting_stack") is None and isinstance(self._hero_hand_start_stack, int):
+                hero["starting_stack"] = self._hero_hand_start_stack
+            if isinstance(self._hero_hand_end_stack, int):
+                hero["ending_stack"] = self._hero_hand_end_stack
+            if self._hero_user_id not in self._current_hand_player_deltas and isinstance(self._hand_hero_winnings, int):
+                if self._hand_hero_winnings >= 0:
+                    hero["amount_won"] = self._hand_hero_winnings
+                    hero["amount_contributed"] = 0
+                    hero["is_winner"] = self._hand_hero_winnings > 0
+                else:
+                    hero["amount_won"] = 0
+                    hero["amount_contributed"] = abs(self._hand_hero_winnings)
+                    hero["is_winner"] = False
 
         self._session_hands_buffer.append(record)
         if isinstance(self._hero_user_id, int):
-            hero_delta = self._current_hand_player_deltas.get(self._hero_user_id, 0)
+            hero_delta = self._current_hand_player_deltas.get(
+                self._hero_user_id,
+                self._hand_hero_winnings if isinstance(self._hand_hero_winnings, int) else 0,
+            )
             self._session_table_delta += hero_delta
             record["hero_delta"] = hero_delta
 
@@ -1565,78 +1582,18 @@ class PreflopApp(tk.Tk):
         self,
         payload: object,
     ) -> tuple[list[str], list[str] | None, int | None, bool, int | None, int | None, int | None, bool | None] | None:
-        if not isinstance(payload, dict):
+        parsed = parse_bridge_payload(payload)
+        if parsed is None:
             return None
-        if payload.get("type") != "poker_cards":
-            return None
-
-        has_hole = "hole" in payload
-        has_board = "board" in payload
-        has_players = "players" in payload
-        has_reset = "reset" in payload
-        has_hand_id = "handId" in payload or "hand_id" in payload
-        has_hero_user_id = "heroUserId" in payload or "hero_user_id" in payload
-        has_hero_seat_id = "heroSeatId" in payload or "hero_seat_id" in payload
-        has_hero_sitting_out = "heroSittingOut" in payload or "hero_sitting_out" in payload
-        if not has_hole and not has_board and not has_players and not has_reset and not has_hand_id and not has_hero_user_id and not has_hero_seat_id and not has_hero_sitting_out:
-            return None
-
-        hole_cards: list[str] = []
-        board_cards: list[str] | None = None
-        players_count: int | None = None
-        reset_state = False
-
-        if has_hole:
-            hole_raw = payload.get("hole")
-            if not isinstance(hole_raw, list) or len(hole_raw) != 2:
-                return None
-            hole_cards = [str(card).strip().upper() for card in hole_raw]
-
-        if has_board:
-            board_raw = payload.get("board")
-            if not isinstance(board_raw, list) or len(board_raw) > 5:
-                return None
-            board_cards = [str(card).strip().upper() for card in board_raw]
-
-        if has_players:
-            players_raw = payload.get("players")
-            if not isinstance(players_raw, int):
-                return None
-            players_count = max(2, min(10, players_raw))
-
-        if has_reset:
-            reset_raw = payload.get("reset")
-            if not isinstance(reset_raw, bool):
-                return None
-            reset_state = reset_raw
-
-        hand_raw = payload.get("handId", payload.get("hand_id"))
-        hand_id: int | None = hand_raw if isinstance(hand_raw, int) else None
-
-        hero_user_raw = payload.get("heroUserId", payload.get("hero_user_id"))
-        hero_user_id: int | None = None
-        if isinstance(hero_user_raw, int):
-            hero_user_id = hero_user_raw
-        elif isinstance(hero_user_raw, str):
-            trimmed = hero_user_raw.strip()
-            if trimmed.isdigit():
-                hero_user_id = int(trimmed)
-
-        hero_seat_raw = payload.get("heroSeatId", payload.get("hero_seat_id"))
-        hero_seat_id: int | None = hero_seat_raw if isinstance(hero_seat_raw, int) else None
-
-        hero_sitting_out_raw = payload.get("heroSittingOut", payload.get("hero_sitting_out"))
-        hero_sitting_out: bool | None = hero_sitting_out_raw if isinstance(hero_sitting_out_raw, bool) else None
-
         return (
-            hole_cards,
-            board_cards,
-            players_count,
-            reset_state,
-            hand_id,
-            hero_user_id,
-            hero_seat_id,
-            hero_sitting_out,
+            parsed.hole_cards,
+            parsed.board_cards,
+            parsed.players_count,
+            parsed.reset_state,
+            parsed.hand_id,
+            parsed.hero_user_id,
+            parsed.hero_seat_id,
+            parsed.hero_sitting_out,
         )
 
     def _extract_player_user_id(self, player: object) -> int | None:
@@ -2088,7 +2045,6 @@ class PreflopApp(tk.Tk):
                     self._hero_folded_waiting_for_new_hole = True
 
         if action_lower == "finishhand":
-            self._flush_hand_tracker()
             seats = update.get("seats")
             if isinstance(seats, list) and self._hero_seat_id is not None:
                 for seat in seats:
@@ -2132,6 +2088,9 @@ class PreflopApp(tk.Tk):
                     finished_at=update.get("finishedAt"),
                 )
 
+            self._flush_hand_tracker()
+
+            if self._hero_sitting_out is not True:
                 if self._hero_stood_up(update):
                     self._finalize_session_to_db()
 

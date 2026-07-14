@@ -23,6 +23,7 @@ This project is nearly completely generated with co-pilot.
 ## Project Structure
 
 - `app.py`: Tkinter app, bridge server, strategy panel, and logging.
+- `bridge_payloads.py`: browser bridge payload schema parsing.
 - `handranker.py`: hand evaluation and simulation logic.
 - `tampermonkey-bridge.user.js`: browser userscript that sends tagged updates.
 - `strategy-training.log`: JSONL training and outcome events.
@@ -77,6 +78,8 @@ python app.py
 4. Confirm the userscript posts to `http://127.0.0.1:5000/log`.
 5. Use the bridge log panel in the app to confirm payloads are arriving.
 
+The userscript is scoped to `casino.org` pages and does not mirror every raw console line by default. It still forwards poker-shaped console events so the strategy panel can follow table action.
+
 Example payload format:
 
 ```json
@@ -123,10 +126,11 @@ Supported fields:
 Quick syntax validation:
 
 ```bash
-python -m py_compile app.py handranker.py
+python -m py_compile app.py handranker.py bridge_payloads.py
+node --check tampermonkey-bridge.user.js
+python -m unittest discover -s tests
 ```
 
 ## License
 
 No license file is currently included in this repository.
-

@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         PokerOdds Tagged Bridge
 // @namespace    http://tampermonkey.net/
-// @version      1.3
+// @version      1.4
 // @description  Forward explicitly tagged poker messages to local PokerOdds bridge
-// @match        *://*/*
+// @match        *://casino.org/*
+// @match        *://*.casino.org/*
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
 // @connect      127.0.0.1
@@ -18,7 +19,8 @@
     var currentBridgeUrlIndex = 0;
     var BRIDGE_TAG = 'TM_BRIDGE:';
     var RAW_TAG = '[RAW_CONSOLE]';
-    var ENABLE_RAW_MIRROR = true;
+    var ENABLE_RAW_MIRROR = false;
+    var ENABLE_STRATEGY_EVENT_MIRROR = true;
     var REHOOK_INTERVAL_MS = 1500;
     var lastSentKey = null;
     var HOOK_FLAG = '__tmPokerBridgeHooked__';
@@ -116,6 +118,62 @@
             return;
         }
         sendLine(RAW_TAG + ' [' + source + ':' + level + '] ' + compactArgs(args));
+    }
+
+    function isPokerStrategyCandidate(value, seen) {
+        if (!value || typeof value !== 'object') {
+            return false;
+        }
+        if (seen.indexOf(value) !== -1) {
+            return false;
+        }
+        seen.push(value);
+
+        if (Object.prototype.hasOwnProperty.call(value, 'action')) {
+            return true;
+        }
+        if (Array.isArray(value.updates)) {
+            return true;
+        }
+        if (
+            Object.prototype.hasOwnProperty.call(value, 'handId') &&
+            (
+                Object.prototype.hasOwnProperty.call(value, 'players') ||
+                Object.prototype.hasOwnProperty.call(value, 'seats') ||
+                Object.prototype.hasOwnProperty.call(value, 'tableId')
+            )
+        ) {
+            return true;
+        }
+
+        var keys = Object.keys(value);
+        for (var i = 0; i < keys.length; i += 1) {
+            var child = value[keys[i]];
+            if (child && typeof child === 'object' && isPokerStrategyCandidate(child, seen)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function sendStrategyEventLines(source, args) {
+        if (!ENABLE_STRATEGY_EVENT_MIRROR || ENABLE_RAW_MIRROR) {
+            return;
+        }
+        for (var i = 0; i < args.length; i += 1) {
+            var arg = args[i];
+            if (!arg || typeof arg !== 'object') {
+                continue;
+            }
+            if (!isPokerStrategyCandidate(arg, [])) {
+                continue;
+            }
+            var text = safeStringify(arg);
+            if (text.length > 2200) {
+                text = text.slice(0, 2200) + '...[truncated]';
+            }
+            sendLine(RAW_TAG + ' [' + source + ':POKER_EVENT] event | ' + text);
+        }
     }
 
     function safeStringify(value) {
@@ -771,6 +829,7 @@
                 } catch (_) {}
 
                 sendRawLine(sourceLabel, method.toUpperCase(), args);
+                sendStrategyEventLines(sourceLabel, args);
 
                 var tagged = taggedLineFromArgs(args);
                 if (tagged) {
