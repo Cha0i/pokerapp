@@ -9,7 +9,7 @@ This project is nearly completely generated with co-pilot.
 - Lets you set hero hole cards and community cards in a desktop UI.
 - Simulates win/tie/loss equity against a configurable number of players.
 - Shows hand-category distribution odds.
-- Opionally runs a local browser bridge server on https://casino.org/replay poker and automatically picks cards, adjust player count and bets as the hand progresses to advice the player. 
+- Optionally runs a local browser bridge server for the selected poker site. The initial supported target is `casino.org/replaypoker`; the app now has a site selector so more targets can be added without hard-coding Replay Poker throughout the UI.
 - Logs advice and outcomes for strategy review.
 
 ## Features
@@ -18,6 +18,7 @@ This project is nearly completely generated with co-pilot.
 - Street-aware strategy coach (preflop, flop, turn, river).
 - Pot/to-call/action-aware recommendations.
 - Browser bridge via tagged payloads (`TM_BRIDGE:{...}`).
+- Site selector backed by a bridge-site catalog. Only `casino.org/replaypoker` is included for now.
 - Training/event logs for post-session analysis.
 
 ## Project Structure
@@ -74,11 +75,16 @@ python app.py
 
 1. Install - [Tampermonkey](https://addons.mozilla.org/en-US/firefox/addon/tampermonkey/) for Firefox.
 2. Import `tampermonkey-bridge.user.js` as a new script.
-3. Launch the app and click **Start Server**.
-4. Confirm the userscript posts to `http://127.0.0.1:5000/log`.
-5. Use the bridge log panel in the app to confirm payloads are arriving.
+3. Launch the app and choose a site from the selector. The only current option is `casino.org/replaypoker`.
+4. Click **Start Server**.
+5. Confirm the userscript posts to `http://127.0.0.1:5000/log`.
+6. Use the bridge log panel in the app to confirm payloads are arriving.
 
-The userscript is scoped to `casino.org` pages and does not mirror every raw console line by default. It still forwards poker-shaped console events so the strategy panel can follow table action.
+The userscript is currently scoped to `casino.org` pages and does not mirror every raw console line by default. It still forwards poker-shaped console events so the strategy panel can follow table action.
+
+### Adding More Sites
+
+Site support starts in `SUPPORTED_BRIDGE_SITES` in `app.py`. Add a `BridgeSite` entry with a display label, target URL, and tracker site name. If the new site needs browser ingestion, also add the matching Tampermonkey `@match` rules and extraction logic in `tampermonkey-bridge.user.js`.
 
 Example payload format:
 

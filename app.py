@@ -85,6 +85,26 @@ class Card:
         return f"{self.rank}{self.suit}"
 
 
+@dataclass(frozen=True)
+class BridgeSite:
+    key: str
+    label: str
+    url: str
+    tracker_site: str
+
+
+SUPPORTED_BRIDGE_SITES = (
+    BridgeSite(
+        key="casino_org_replaypoker",
+        label="casino.org/replaypoker",
+        url="https://casino.org/replaypoker",
+        tracker_site="ReplayPoker",
+    ),
+)
+DEFAULT_BRIDGE_SITE = SUPPORTED_BRIDGE_SITES[0]
+BRIDGE_SITES_BY_LABEL = {site.label: site for site in SUPPORTED_BRIDGE_SITES}
+
+
 class PreflopApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -140,12 +160,13 @@ class PreflopApp(tk.Tk):
         self.equity_label: tk.Label | None = None
         self.odds_note_label: tk.Label | None = None
         self.hand_rank_note_label: tk.Label | None = None
-        self.subtitle_label: tk.Label | None = None
+        self.site_selector_menu: tk.OptionMenu | None = None
         self.advice_label: tk.Label | None = None
         self.current_hand_label: tk.Label | None = None
         self.maximize_button: tk.Button | None = None
         self.hero_name_label: tk.Label | None = None
         self.hero_name_entry: tk.Entry | None = None
+        self.hero_name_set_button: tk.Button | None = None
         self.clear_hole_button: tk.Button | None = None
         self.clear_board_button: tk.Button | None = None
         self.reset_all_button: tk.Button | None = None
@@ -184,8 +205,11 @@ class PreflopApp(tk.Tk):
         self._is_minimized = False
 
         self.server_status_var = tk.StringVar(value="Bridge: offline")
-        self.server_info_var = tk.StringVar(value="Send tagged JSON: TM_BRIDGE:{\"type\":\"poker_cards\",...}")
+        self.site_var = tk.StringVar(value=DEFAULT_BRIDGE_SITE.label)
+        self.server_info_var = tk.StringVar(value=self._bridge_idle_info())
+        self.hero_name_input_var = tk.StringVar(value="xtlx")
         self.hero_name_var = tk.StringVar(value="player")
+        self._hero_name_confirm_job: str | None = None
         self._server_running = False
         self._server: any = None
         self._server_thread: threading.Thread | None = None
@@ -255,6 +279,7 @@ class PreflopApp(tk.Tk):
         self._seen_update_order: list[tuple[int, int, str]] = []
         self._seen_update_limit = 4000
         self._bridge_available = _BRIDGE_DEPENDENCIES_AVAILABLE
+        self.site_var.trace_add("write", self._handle_site_changed)
 
         self.board_cards: dict[str, Card | None] = {
             "flop_1": None,
@@ -325,6 +350,32 @@ class PreflopApp(tk.Tk):
             return "#ffd60a"
         return "#2dc653"
 
+    def _current_bridge_site(self) -> BridgeSite:
+        try:
+            label = self.site_var.get()
+        except (AttributeError, tk.TclError):
+            return DEFAULT_BRIDGE_SITE
+        return BRIDGE_SITES_BY_LABEL.get(label, DEFAULT_BRIDGE_SITE)
+
+    def _current_tracker_site(self) -> str:
+        return self._current_bridge_site().tracker_site
+
+    def _bridge_idle_info(self) -> str:
+        site = self._current_bridge_site()
+        return f"Selected site: {site.url}. Send tagged JSON: TM_BRIDGE:{{\"type\":\"poker_cards\",...}}"
+
+    def _bridge_waiting_info(self) -> str:
+        return f"Waiting for {self._current_bridge_site().label} tagged bridge lines..."
+
+    def _handle_site_changed(self, *_args: object) -> None:
+        if not getattr(self, "_bridge_available", True):
+            return
+        if getattr(self, "_server_running", False):
+            self.server_info_var.set(self._bridge_waiting_info())
+        else:
+            self.server_info_var.set(self._bridge_idle_info())
+        self._append_server_log(f"[bridge] selected site: {self._current_bridge_site().label}")
+
     def _build_ui(self) -> None:
         shell = tk.Frame(self, bg=BG_MAIN, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1, bd=0)
         shell.pack(fill="both", expand=True)
@@ -342,29 +393,13 @@ class PreflopApp(tk.Tk):
         root.columnconfigure(0, weight=1, uniform="top")
         root.columnconfigure(1, weight=2, uniform="top")
         root.columnconfigure(2, weight=1, uniform="top")
-        root.rowconfigure(2, weight=5)
-        root.rowconfigure(3, weight=4)
+        root.rowconfigure(1, weight=5)
+        root.rowconfigure(2, weight=4)
 
-        tk.Label(
-            root,
-            text="Poker Hand Trainer by Cha0i",
-            font=self.fonts["title"],
-            bg=BG_MAIN,
-            fg=FG_MAIN,
-        ).grid(row=0, column=0, columnspan=3, sticky="w")
-        self.subtitle_label = tk.Label(
-            root,
-            text="Remember to keep adjusting the player count to accurately calculate odds.",
-            font=self.fonts["subtitle"],
-            bg=BG_MAIN,
-            fg=FG_MUTED,
-            justify="left",
-            anchor="w",
-        )
-        self.subtitle_label.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(2, 8))
+        self._build_site_selector(root)
 
         top_center = tk.Frame(root, bg=BG_MAIN)
-        top_center.grid(row=2, column=1, columnspan=2, sticky="nsew", padx=(8, 0))
+        top_center.grid(row=1, column=1, columnspan=2, sticky="nsew", padx=(8, 0))
         top_center.columnconfigure(0, weight=2)
         top_center.columnconfigure(1, weight=1)
         top_center.rowconfigure(0, weight=1)
@@ -419,7 +454,7 @@ class PreflopApp(tk.Tk):
         self._build_strategy_column(top_center)
 
         info_row = tk.Frame(root, bg=BG_MAIN)
-        info_row.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
+        info_row.grid(row=2, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
         info_row.columnconfigure(0, weight=3)
         info_row.columnconfigure(1, weight=2)
         info_row.columnconfigure(2, weight=2)
@@ -433,6 +468,45 @@ class PreflopApp(tk.Tk):
         self._build_player_tracker_column(shell)
         shell.columnconfigure(1, minsize=self._tracker_column_width)
         self._set_player_tracker_visibility(False, resize_window=False)
+
+    def _build_site_selector(self, root: tk.Frame) -> None:
+        frame = tk.Frame(root, bg=BG_MAIN)
+        frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        frame.columnconfigure(1, weight=0)
+        frame.columnconfigure(2, weight=1)
+
+        tk.Label(
+            frame,
+            text="Site:",
+            font=self.fonts["label"],
+            bg=BG_MAIN,
+            fg=FG_MUTED,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 6))
+
+        site_labels = [site.label for site in SUPPORTED_BRIDGE_SITES]
+        self.site_selector_menu = tk.OptionMenu(frame, self.site_var, *site_labels)
+        self.site_selector_menu.configure(
+            font=self.fonts["label"],
+            width=24,
+            relief="flat",
+            bg=BG_BUTTON,
+            fg=FG_MAIN,
+            activebackground="#3a4556",
+            activeforeground=FG_MAIN,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.site_selector_menu.grid(row=0, column=1, sticky="w")
+        menu = self.nametowidget(self.site_selector_menu["menu"])
+        menu.configure(
+            font=self.fonts["label"],
+            bg=BG_PANEL,
+            fg=FG_MAIN,
+            activebackground="#3a4556",
+            activeforeground=FG_MAIN,
+            bd=0,
+        )
 
     def _build_player_tracker_column(self, shell: tk.Frame) -> None:
         frame = tk.Frame(shell, bg=BG_PANEL, padx=10, pady=10, width=self._tracker_column_width, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1)
@@ -709,7 +783,7 @@ class PreflopApp(tk.Tk):
                             INSERT OR REPLACE INTO Players (player_id, screen_name, site)
                             VALUES (?, ?, ?)
                             """,
-                            (player_id, screen_name, "ReplayPoker"),
+                            (player_id, screen_name, self._current_tracker_site()),
                         )
                         cur.execute(
                             """
@@ -1144,7 +1218,7 @@ class PreflopApp(tk.Tk):
 
     def _build_server_column(self, root: tk.Frame) -> None:
         frame = tk.Frame(root, bg=BG_PANEL, padx=10, pady=10, highlightbackground="#27303d", highlightcolor="#27303d", highlightthickness=1)
-        frame.grid(row=2, column=0, sticky="nsew", padx=(0, 8))
+        frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         frame.columnconfigure(0, weight=1)
         self.server_frame = frame
 
@@ -1535,7 +1609,7 @@ class PreflopApp(tk.Tk):
         self._server_thread.start()
         self._server_running = True
         self._set_server_status("Bridge: online on 127.0.0.1:5000", True)
-        self.server_info_var.set("Waiting for tagged bridge lines...")
+        self.server_info_var.set(self._bridge_waiting_info())
         if self.server_toggle_button is not None:
             self.server_toggle_button.configure(text="Stop Server")
         self._append_server_log("[bridge] server started on http://127.0.0.1:5000/log")
@@ -1554,7 +1628,7 @@ class PreflopApp(tk.Tk):
             self._server_thread = None
             self._server_running = False
             self._set_server_status("Bridge: offline", False)
-            self.server_info_var.set("Send tagged JSON: TM_BRIDGE:{\"type\":\"poker_cards\",...}")
+            self.server_info_var.set(self._bridge_idle_info())
             if self.server_toggle_button is not None:
                 self.server_toggle_button.configure(text="Start Server")
             self._append_server_log("[bridge] server stopped")
@@ -1618,7 +1692,42 @@ class PreflopApp(tk.Tk):
         return None
 
     def _hero_name(self) -> str:
-        return self.hero_name_var.get().strip().lower()
+        var = getattr(self, "hero_name_var", None)
+        if var is None:
+            return ""
+        return var.get().strip().lower()
+
+    def _set_hero_name(self) -> None:
+        name = self.hero_name_input_var.get().strip()
+        previous_name = self.hero_name_var.get().strip()
+        self.hero_name_input_var.set(name)
+        self.hero_name_var.set(name)
+        if name != previous_name:
+            self._hero_user_id = None
+            self._hero_seat_id = None
+            self._hero_sitting_out = None
+        display_name = name or "(empty)"
+        self._append_server_log(f"[bridge] player name set to {display_name!r}")
+        self._log_app_action("hero_name_set", hero_name=name)
+        self._flash_hero_name_set_button()
+        self._update_strategy_panel()
+        self._refresh_player_tracker_panel()
+
+    def _flash_hero_name_set_button(self) -> None:
+        if self.hero_name_set_button is None:
+            return
+        if self._hero_name_confirm_job is not None:
+            try:
+                self.after_cancel(self._hero_name_confirm_job)
+            except tk.TclError:
+                pass
+        self.hero_name_set_button.configure(text="Set!")
+        self._hero_name_confirm_job = self.after(1200, self._reset_hero_name_set_button)
+
+    def _reset_hero_name_set_button(self) -> None:
+        self._hero_name_confirm_job = None
+        if self.hero_name_set_button is not None:
+            self.hero_name_set_button.configure(text="Set")
 
     def _extract_player_name(self, player: object) -> str | None:
         if not isinstance(player, dict):
@@ -2571,6 +2680,12 @@ class PreflopApp(tk.Tk):
         self._update_strategy_panel()
 
     def destroy(self) -> None:
+        if self._hero_name_confirm_job is not None:
+            try:
+                self.after_cancel(self._hero_name_confirm_job)
+            except tk.TclError:
+                pass
+            self._hero_name_confirm_job = None
         if self._server_poll_job is not None:
             try:
                 self.after_cancel(self._server_poll_job)
@@ -2614,7 +2729,7 @@ class PreflopApp(tk.Tk):
         self.hero_name_label.grid(row=0, column=0, padx=(0, 4), pady=1)
         self.hero_name_entry = tk.Entry(
             identity,
-            textvariable=self.hero_name_var,
+            textvariable=self.hero_name_input_var,
             width=12,
             font=self.fonts["small"],
             bg="#0f141b",
@@ -2626,6 +2741,23 @@ class PreflopApp(tk.Tk):
             highlightcolor="#4d6280",
         )
         self.hero_name_entry.grid(row=0, column=1, padx=(0, 0), pady=1)
+        self.hero_name_entry.bind("<Return>", lambda _event: self._set_hero_name())
+        self.hero_name_set_button = tk.Button(
+            identity,
+            text="Set",
+            font=self.fonts["small"],
+            width=4,
+            command=self._set_hero_name,
+            relief="flat",
+            bg=BG_BUTTON,
+            fg=FG_MAIN,
+            activebackground="#3a4556",
+            activeforeground=FG_MAIN,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self.hero_name_set_button.grid(row=0, column=2, padx=(4, 0), pady=1)
 
         buttons = tk.Frame(bar, bg=BG_PANEL)
         buttons.grid(row=0, column=2, sticky="e")
@@ -3110,9 +3242,8 @@ class PreflopApp(tk.Tk):
             self.players_decrease_button.configure(width=player_button_width, height=card_height)
         if self.players_increase_button is not None:
             self.players_increase_button.configure(width=player_button_width, height=card_height)
-
-        if self.subtitle_label is not None:
-            self.subtitle_label.configure(wraplength=max(260, content_width - 80))
+        if self.site_selector_menu is not None:
+            self.site_selector_menu.configure(font=self.fonts["label"])
         panel_wrap = max(120, int((content_width - 84) / 3) - 20)
         text_wrap = max(120, min(250, panel_wrap))
         left_wrap = text_wrap
