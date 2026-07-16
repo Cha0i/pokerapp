@@ -23,6 +23,31 @@ class PreflopResult:
     reason: str
 
 
+@dataclass(frozen=True)
+class PostflopProfile:
+    made_hand: str
+    category: str
+    pair_strength: str | None
+    flush_draw: bool
+    straight_draw_ranks: int
+    draw_outs: int
+    cards_to_come: int
+    plays_board: bool
+
+    @property
+    def strong_draw(self) -> bool:
+        return self.flush_draw or self.straight_draw_ranks >= 2
+
+    @property
+    def gutshot(self) -> bool:
+        return self.straight_draw_ranks == 1
+
+    @property
+    def next_card_draw_equity(self) -> float:
+        unseen_cards = 45 + self.cards_to_come
+        return self.draw_outs / unseen_cards if self.draw_outs > 0 else 0.0
+
+
 PREMIUM = {"AA", "KK", "QQ", "JJ", "AKs"}
 STRONG = {"TT", "AKo", "AQs", "AJs", "KQs", "99"}
 PLAYABLE = {
@@ -407,6 +432,79 @@ def describe_current_hand(hero_cards: Sequence[str], board_cards: Sequence[str])
     if category == 1:
         return f"Pair of {_plural_name(detail[0])}"
     return f"{_high_card_name(detail[0])} high"
+
+
+def analyze_postflop(hero_cards: Sequence[str], board_cards: Sequence[str]) -> PostflopProfile:
+    known_board = [card for card in board_cards if card]
+    if len(hero_cards) != 2:
+        raise ValueError("Hero cards must contain exactly two cards.")
+    if not 3 <= len(known_board) <= 5:
+        raise ValueError("Postflop analysis requires three to five board cards.")
+
+    used = [*hero_cards, *known_board]
+    if len(set(used)) != len(used):
+        raise ValueError("Duplicate card detected in hero or board cards.")
+
+    score = _best_hand(used)
+    category = CATEGORY_VALUE_TO_KEY[score[0]]
+    hero_ranks = [_parse_card(card)[0] for card in hero_cards]
+    board_ranks = [_parse_card(card)[0] for card in known_board]
+    board_counts = Counter(board_ranks)
+    pair_strength: str | None = None
+
+    if category == "one_pair":
+        if hero_ranks[0] == hero_ranks[1]:
+            pair_strength = "overpair" if hero_ranks[0] > max(board_ranks) else "underpair"
+        else:
+            matched = sorted(set(hero_ranks) & set(board_ranks), reverse=True)
+            if matched:
+                pair_strength = "top_pair" if matched[0] == max(board_ranks) else "lower_pair"
+            elif any(count >= 2 for count in board_counts.values()):
+                pair_strength = "board_pair"
+            else:
+                pair_strength = "weak_pair"
+    elif category == "two_pair":
+        board_pairs = sum(1 for count in board_counts.values() if count >= 2)
+        pair_strength = "board_two_pair" if board_pairs >= 2 and not (set(hero_ranks) & set(board_ranks)) else "two_pair"
+
+    all_suits = [card[1].lower() for card in used]
+    hero_suits = {card[1].lower() for card in hero_cards}
+    flush_draw = False
+    if len(known_board) < 5 and score[0] < 5:
+        suit_counts = Counter(all_suits)
+        flush_draw = any(count == 4 and suit in hero_suits for suit, count in suit_counts.items())
+
+    straight_draw_values: set[int] = set()
+    if len(known_board) < 5 and score[0] < 4:
+        rank_values = set(hero_ranks + board_ranks)
+        straight_values = set(rank_values)
+        if 14 in straight_values:
+            straight_values.add(1)
+        hero_values = set(hero_ranks)
+        if 14 in hero_values:
+            hero_values.add(1)
+        for low in range(1, 11):
+            sequence = set(range(low, low + 5))
+            missing = sequence - straight_values
+            if len(missing) == 1 and sequence & hero_values:
+                missing_value = next(iter(missing))
+                straight_draw_values.add(14 if missing_value == 1 else missing_value)
+
+    plays_board = len(known_board) == 5 and _best_hand(known_board) == score
+    straight_outs = len(straight_draw_values) * 4
+    flush_outs = 9 if flush_draw else 0
+    overlap_outs = len(straight_draw_values) if flush_draw else 0
+    draw_outs = min(15, straight_outs + flush_outs - overlap_outs)
+    return PostflopProfile(
+        made_hand=describe_current_hand(hero_cards, known_board),
+        category=category,
+        pair_strength=pair_strength,
+        flush_draw=flush_draw,
+        straight_draw_ranks=len(straight_draw_values),
+        draw_outs=draw_outs,
+        cards_to_come=5 - len(known_board),
+        plays_board=plays_board,
+    )
 
 
 def simulate_equity(

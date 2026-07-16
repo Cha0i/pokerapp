@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import html
 import re
 import sqlite3
 import threading
 import sys
+import traceback
 import tkinter as tk
 import tkinter.font as tkfont
 from datetime import datetime, timezone
@@ -22,10 +24,12 @@ except ImportError:
     make_server = None  # type: ignore[assignment]
     _BRIDGE_DEPENDENCIES_AVAILABLE = False
 
-from bridge_payloads import parse_bridge_payload
+from bridge_payloads import parse_bridge_payload, redact_bridge_log_line
 from handranker import (
     HAND_CATEGORY_ORDER,
+    PostflopProfile,
     RANKS_DESC,
+    analyze_postflop,
     describe_current_hand,
     evaluate_preflop,
     simulate_equity,
@@ -91,6 +95,96 @@ class BridgeSite:
     label: str
     url: str
     tracker_site: str
+    allowed_origins: tuple[str, ...]
+
+
+def _range_adjusted_equity_target(pot_odds: float, players: int) -> float:
+    buffer = 0.06
+    if pot_odds >= 0.25:
+        buffer += 0.04
+    if pot_odds >= 0.33:
+        buffer += 0.04
+    if players >= 3:
+        buffer += 0.04
+    return min(0.95, pot_odds + buffer)
+
+
+def _recommend_facing_postflop_bet(
+    profile: PostflopProfile,
+    equity: float | None,
+    pot_odds: float,
+    players: int,
+) -> tuple[str, str, float]:
+    target = _range_adjusted_equity_target(pot_odds, players)
+    has_target_equity = equity is not None and equity >= target
+
+    if profile.plays_board:
+        return "BOARD PLAYS. FOLD TO PRESSURE.", "The board supplies the made hand, so a bettor can still hold cards that improve on it.", target
+    if profile.category in {"straight_flush", "four_kind", "full_house", "flush", "straight", "three_kind"}:
+        if has_target_equity or profile.category in {"straight_flush", "four_kind", "full_house"}:
+            return "STRONG MADE HAND. RAISE FOR VALUE.", "Your actual made hand supports continuing aggressively.", target
+        return "STRONG MADE HAND. CALL, REASSESS LATER.", "The hand is strong, but the price and betting range argue against an automatic raise.", target
+    if profile.category == "two_pair" and profile.pair_strength != "board_two_pair":
+        if has_target_equity:
+            return "TWO PAIR. CALL OR RAISE CAREFULLY.", "Two pair has real showdown strength, though coordinated boards can still contain stronger value.", target
+        return "TWO PAIR UNDER PRESSURE. CALL CAUTIOUSLY.", "The made hand is real, but the price is demanding enough to avoid a large raise.", target
+    if profile.category == "one_pair" and profile.pair_strength in {"top_pair", "overpair"}:
+        if has_target_equity:
+            return "ONE-PAIR HAND. CALL CAUTIOUSLY.", "Top pair or an overpair can continue at this price, but it is not automatically a raising hand.", target
+        return "ONE PAIR, BAD PRICE. FOLD.", "A betting range is stronger than a random hand, and this price needs more than one-pair optimism.", target
+    if profile.category == "one_pair" and profile.pair_strength in {"lower_pair", "underpair"}:
+        if pot_odds <= 0.22 and has_target_equity:
+            return "MARGINAL PAIR. CALL SMALL ONLY.", "The price is small enough for a cautious bluff catch, not a raise.", target
+        return "MARGINAL PAIR. FOLD TO PRESSURE.", "A lower pair is too fragile against this price and a betting range.", target
+    if profile.strong_draw:
+        draw_price_limit = profile.next_card_draw_equity + (0.03 if players == 2 else 0.01)
+        if pot_odds <= draw_price_limit:
+            return "STRONG DRAW. CALL AT THIS PRICE.", "The immediate straight or flush draw has enough buffered equity to continue.", target
+        return "DRAW, BUT PRICE IS TOO HIGH. FOLD.", "The direct draw odds plus a small implied-odds allowance do not cover this call price.", target
+    if profile.gutshot:
+        draw_price_limit = profile.next_card_draw_equity + (0.02 if players == 2 else 0.0)
+        if pot_odds <= draw_price_limit:
+            return "GUTSHOT. CALL SMALL ONLY.", "A very small price can justify chasing the four-out draw.", target
+        return "GUTSHOT OR OVERCARDS. FOLD.", "Random-hand equity overstates this weak draw against a player who chose to bet.", target
+    if profile.category == "one_pair" and profile.pair_strength == "board_pair":
+        return "BOARD PAIR ONLY. FOLD.", "The pair belongs to the board; your hole cards have not made a pair.", target
+    return "WEAK HAND VS BET. FOLD.", "High-card equity against random cards is not enough evidence to call an actual betting range.", target
+
+
+def _recommend_when_checked_to(profile: PostflopProfile) -> tuple[str, str]:
+    if profile.plays_board:
+        return "BOARD PLAYS. CHECK.", "Your hole cards do not improve the board, so there is no clean value bet."
+    if profile.category in {"straight_flush", "four_kind", "full_house", "flush", "straight", "three_kind"}:
+        return "STRONG MADE HAND. BET FOR VALUE.", "This hand is strong enough to build the pot without relying on raw equity alone."
+    if profile.category == "two_pair" and profile.pair_strength != "board_two_pair":
+        return "TWO PAIR. BET SMALL TO MEDIUM.", "Charge one-pair hands while keeping the sizing controlled on coordinated boards."
+    if profile.category == "one_pair" and profile.pair_strength in {"top_pair", "overpair"}:
+        return "ONE-PAIR VALUE. BET SMALL TO MEDIUM.", "Top pair or an overpair can value bet, but it is not a monster by default."
+    if profile.category == "one_pair" and profile.pair_strength in {"lower_pair", "underpair"}:
+        return "MARGINAL PAIR. CHECK OR BET SMALL.", "Protect showdown value and avoid building a large pot with one fragile pair."
+    if profile.strong_draw:
+        return "STRONG DRAW. CHECK OR BET SMALL.", "A small semi-bluff is reasonable, but this is drawing equity rather than made-hand value."
+    if profile.gutshot:
+        return "WEAK DRAW. CHECK.", "Take the free card; a gutshot alone is not a value hand."
+    if profile.category == "one_pair" and profile.pair_strength == "board_pair":
+        return "BOARD PAIR ONLY. CHECK.", "Your hole cards have not made a pair, so avoid treating the board's pair as value."
+    return "HIGH CARD. CHECK.", "Take the free option instead of converting random-hand equity into a value bet."
+
+
+def _describe_current_hand_context(hero_cards: list[str], board_cards: list[str]) -> str:
+    made_hand = describe_current_hand(hero_cards, board_cards)
+    known_board = [card for card in board_cards if card]
+    if len(known_board) < 3:
+        return made_hand
+
+    profile = analyze_postflop(hero_cards, known_board)
+    if profile.pair_strength == "board_pair":
+        return f"{made_hand} (pair is on the board)"
+    if profile.pair_strength == "board_two_pair":
+        return f"{made_hand} (both pairs are on the board)"
+    if profile.plays_board:
+        return f"{made_hand} (board plays)"
+    return made_hand
 
 
 SUPPORTED_BRIDGE_SITES = (
@@ -99,24 +193,44 @@ SUPPORTED_BRIDGE_SITES = (
         label="casino.org/replaypoker",
         url="https://casino.org/replaypoker",
         tracker_site="ReplayPoker",
+        allowed_origins=("https://casino.org", "https://www.casino.org"),
+    ),
+    BridgeSite(
+        key="unibet_nl_pokerwebclient",
+        label="unibet.nl/pokerwebclient",
+        url="https://www.unibet.nl/play/pokerwebclient#playforreal",
+        tracker_site="Unibet",
+        allowed_origins=("https://www.unibet.nl", "https://unibet.nl"),
     ),
 )
 DEFAULT_BRIDGE_SITE = SUPPORTED_BRIDGE_SITES[0]
 BRIDGE_SITES_BY_LABEL = {site.label: site for site in SUPPORTED_BRIDGE_SITES}
+BRIDGE_ALLOWED_ORIGINS = {
+    origin
+    for site in SUPPORTED_BRIDGE_SITES
+    for origin in site.allowed_origins
+}
+BRIDGE_USERSCRIPT_VERSION = "2.4"
 
 
 class PreflopApp(tk.Tk):
-    def __init__(self) -> None:
+    def __init__(self, use_custom_chrome: bool = True) -> None:
         super().__init__()
-        self._use_custom_chrome = True
+        self._use_custom_chrome = use_custom_chrome
+        self._custom_chrome_backend = "override_redirect" if use_custom_chrome else "standard"
+        self._startup_window_checked = False
+        self._custom_chrome_ready = use_custom_chrome
+        self._custom_chrome_startup_attempts = 0
         self.title("Poker Hand Trainers by Cha0i")
-        self.geometry("900x1600")
+        self._set_initial_geometry()
         self.minsize(760, 520)
         self.resizable(True, True)
         self.configure(bg=BG_MAIN, highlightthickness=0, bd=0)
         self.option_add("*HighlightThickness", 0)
-        if self._use_custom_chrome:
+        if self._custom_chrome_backend == "override_redirect":
             self.overrideredirect(True)
+        else:
+            self.withdraw()
         self.fonts = {
             "title": tkfont.Font(family="Helvetica", size=BASE_FONT_SIZES["title"], weight="bold"),
             "subtitle": tkfont.Font(family="Helvetica", size=BASE_FONT_SIZES["subtitle"]),
@@ -216,6 +330,8 @@ class PreflopApp(tk.Tk):
         self._incoming_logs: Queue[str] = Queue()
         self._server_poll_job: str | None = None
         self._bridge_log_file = Path(__file__).resolve().parent / "browser-console.log"
+        self._bridge_userscript_file = Path(__file__).resolve().parent / "tampermonkey-bridge.user.js"
+        self._legacy_unibet_warning_sent = False
         self._app_actions_log_file = Path(__file__).resolve().parent / "app-actions.log"
         self._strategy_training_log_file = Path(__file__).resolve().parent / "strategy-training.log"
         self._player_tracker_db_file = Path(__file__).resolve().parent / "player-history.db"
@@ -257,6 +373,7 @@ class PreflopApp(tk.Tk):
         self._hero_seat_id: int | None = None
         self._hero_user_id: int | None = None
         self._hero_sitting_out: bool | None = None
+        self._hero_turn: bool | None = None
         self._pot_chips: int | None = None
         self._to_call_chips: int | None = None
         self._minimum_raise_chips: int | None = None
@@ -278,6 +395,20 @@ class PreflopApp(tk.Tk):
         self._seen_update_keys: set[tuple[int, int, str]] = set()
         self._seen_update_order: list[tuple[int, int, str]] = []
         self._seen_update_limit = 4000
+        self._unibet_raw_hand_id: int | None = None
+        self._unibet_raw_hole_key: str | None = None
+        self._unibet_raw_hole_cards: list[str] | None = None
+        self._unibet_raw_board_key: str | None = None
+        self._unibet_raw_board_cards: list[str] = []
+        self._unibet_raw_players_count: int | None = None
+        self._unibet_raw_hero_sitting_out: bool | None = None
+        self._unibet_raw_hero_folded: bool | None = None
+        self._unibet_raw_hero_turn: bool | None = None
+        self._unibet_raw_pot: int | None = None
+        self._unibet_raw_to_call: int | None = None
+        self._unibet_raw_minimum_raise: int | None = None
+        self._unibet_raw_reset_sent = False
+        self._bridge_card_table_id: str | None = None
         self._bridge_available = _BRIDGE_DEPENDENCIES_AVAILABLE
         self.site_var.trace_add("write", self._handle_site_changed)
 
@@ -289,7 +420,7 @@ class PreflopApp(tk.Tk):
             "river": None,
         }
 
-        if self._use_custom_chrome:
+        if self._custom_chrome_backend == "override_redirect":
             self.bind("<Map>", self._restore_override_redirect)
         self.bind("<Configure>", self._schedule_layout_refresh)
         self._init_player_tracker_db()
@@ -302,12 +433,121 @@ class PreflopApp(tk.Tk):
         if not self._bridge_available:
             self.server_status_var.set("Bridge: unavailable (install Flask and Werkzeug)")
             self.server_info_var.set("Core app will run without the browser bridge.")
+        self.after_idle(self._present_startup_window)
         self.after(120, self._ensure_window_visible)
+        self.after(900, self._recover_invisible_startup_window)
+
+    def _set_initial_geometry(self) -> None:
+        screen_width = max(900, self.winfo_screenwidth())
+        screen_height = max(620, self.winfo_screenheight())
+        width = max(760, min(900, screen_width - 80))
+        height = max(520, min(1600, screen_height - 80))
+        x = max(0, min(80, screen_width - width))
+        y = max(0, min(80, screen_height - height))
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def report_callback_exception(self, exc: type[BaseException], value: BaseException, tb: object) -> None:
+        print("Poker Hand Trainer callback failed:", file=sys.stderr, flush=True)
+        traceback.print_exception(exc, value, tb)
+
+    def _clamp_window_to_screen(self) -> None:
+        self.update_idletasks()
+        width = max(self.winfo_width(), 760)
+        height = max(self.winfo_height(), 520)
+        screen_width = max(900, self.winfo_screenwidth())
+        screen_height = max(620, self.winfo_screenheight())
+        max_x = max(0, screen_width - min(width, screen_width))
+        max_y = max(0, screen_height - min(height, screen_height))
+        x = min(max(0, self.winfo_x()), max_x)
+        y = min(max(0, self.winfo_y()), max_y)
+        if (x, y) != (self.winfo_x(), self.winfo_y()):
+            self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _present_startup_window(self) -> None:
+        if not self.winfo_exists():
+            return
+        try:
+            self.update_idletasks()
+            if self.state() in {"iconic", "withdrawn"}:
+                self.deiconify()
+            self.state("normal")
+            self._clamp_window_to_screen()
+            self.lift()
+            self.attributes("-topmost", True)
+            self.after(250, lambda: self.attributes("-topmost", False) if self.winfo_exists() else None)
+            self.focus_force()
+            self.update_idletasks()
+        except tk.TclError:
+            return
+
+    def _activate_custom_chrome_after_startup(self) -> None:
+        if self._custom_chrome_backend != "override_redirect" or not self.winfo_exists():
+            return
+        if self._custom_chrome_ready:
+            return
+        try:
+            self._present_startup_window()
+            if not (self.winfo_ismapped() and self.winfo_viewable()):
+                self._custom_chrome_startup_attempts += 1
+                if self._custom_chrome_startup_attempts <= 8:
+                    self.after(250, self._activate_custom_chrome_after_startup)
+                else:
+                    print(
+                        "Custom window chrome is waiting for the desktop to map the window.",
+                        flush=True,
+                    )
+                return
+            geometry = self.geometry()
+            self.withdraw()
+            self.update_idletasks()
+            self.overrideredirect(True)
+            self.geometry(geometry)
+            self.deiconify()
+            self.state("normal")
+            self.lift()
+            self.focus_force()
+            self.update_idletasks()
+            if not (self.winfo_ismapped() and self.winfo_viewable()):
+                self.overrideredirect(False)
+                self.deiconify()
+                self.state("normal")
+                self._present_startup_window()
+                print(
+                    "Custom window chrome did not map cleanly; keeping the standard window visible.",
+                    flush=True,
+                )
+                return
+            self._custom_chrome_ready = True
+        except tk.TclError:
+            return
+
+    def _recover_invisible_startup_window(self) -> None:
+        if self._startup_window_checked or not self.winfo_exists():
+            return
+        self._startup_window_checked = True
+        try:
+            self._present_startup_window()
+            if self.winfo_ismapped() and self.winfo_viewable():
+                if self._custom_chrome_backend == "override_redirect" and not self._custom_chrome_ready:
+                    self.after(100, self._activate_custom_chrome_after_startup)
+                return
+            if self._custom_chrome_backend == "override_redirect":
+                print(
+                    "Custom window chrome startup needed a remap; retrying borderless window presentation.",
+                    flush=True,
+                )
+                self.geometry("+80+80")
+                self.deiconify()
+                self.state("normal")
+                self._present_startup_window()
+        except tk.TclError:
+            return
 
     def _ensure_window_visible(self) -> None:
         if not self.winfo_exists():
             return
         try:
+            self._clamp_window_to_screen()
             if self.state() == "iconic":
                 self.deiconify()
             self.lift()
@@ -385,7 +625,6 @@ class PreflopApp(tk.Tk):
         shell.rowconfigure(1, weight=1)
 
         self._build_title_bar(shell)
-        self._build_resize_grips(shell)
 
         root = tk.Frame(shell, padx=10, pady=10, bg=BG_MAIN, highlightthickness=0, bd=0)
         root.grid(row=1, column=0, sticky="nsew")
@@ -468,6 +707,7 @@ class PreflopApp(tk.Tk):
         self._build_player_tracker_column(shell)
         shell.columnconfigure(1, minsize=self._tracker_column_width)
         self._set_player_tracker_visibility(False, resize_window=False)
+        self._build_resize_grips(shell)
 
     def _build_site_selector(self, root: tk.Frame) -> None:
         frame = tk.Frame(root, bg=BG_MAIN)
@@ -1454,7 +1694,7 @@ class PreflopApp(tk.Tk):
         normalized = made_hand_text.strip().lower()
         if not normalized:
             return False
-        return normalized.startswith("high card")
+        return normalized.startswith("high card") or normalized.endswith(" high")
 
     def _enforce_advice_consistency(
         self,
@@ -1467,7 +1707,7 @@ class PreflopApp(tk.Tk):
         high_card_only = self._is_high_card_only(made_hand_text)
 
         # Guard against contradictory "air" labels when we actually have made strength.
-        if "AIR" in normalized_headline and not high_card_only:
+        if re.search(r"\bAIR\b", normalized_headline) and not high_card_only:
             if to_call > 0:
                 headline = "SHOWDOWN VALUE. CALL SMALL, FOLD TO HEAT."
             else:
@@ -1501,11 +1741,37 @@ class PreflopApp(tk.Tk):
             "players": self.players_var.get(),
             "pot": self._pot_chips,
             "to_call": self._to_call_chips,
+            "random_equity": self._equity_fraction(),
+            "pot_odds": (
+                self._to_call_chips / (self._pot_chips + self._to_call_chips)
+                if isinstance(self._pot_chips, int)
+                and isinstance(self._to_call_chips, int)
+                and self._to_call_chips > 0
+                and self._pot_chips + self._to_call_chips > 0
+                else None
+            ),
             "hole": [card.code for card in self.selected],
             "board": [card.code for card in self.board_cards.values() if card is not None],
             "advice_headline": self._strategy_headline(),
             "advice_recommendation": self._strategy_recommendation(),
         }
+        board_codes = [card.code for card in self.board_cards.values() if card is not None]
+        if len(self.selected) == 2 and len(board_codes) >= 3:
+            profile = analyze_postflop([card.code for card in self.selected], board_codes)
+            record.update(
+                {
+                    "made_hand": profile.made_hand,
+                    "made_hand_category": profile.category,
+                    "pair_strength": profile.pair_strength,
+                    "draw_outs": profile.draw_outs,
+                    "next_card_draw_equity": profile.next_card_draw_equity,
+                    "range_equity_target": (
+                        _range_adjusted_equity_target(record["pot_odds"], self.players_var.get())
+                        if isinstance(record["pot_odds"], float)
+                        else None
+                    ),
+                }
+            )
         for key, value in fields.items():
             record[key] = value
         try:
@@ -1579,11 +1845,41 @@ class PreflopApp(tk.Tk):
         assert make_server is not None
         app = Flask("pokerodds_bridge")
         incoming = self._incoming_logs
+        userscript_file = self._bridge_userscript_file
+
+        def add_bridge_cors_headers(response: object) -> object:
+            origin = request.headers.get("Origin")
+            if origin in BRIDGE_ALLOWED_ORIGINS:
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Vary"] = "Origin"
+                response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+                response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+            return response
+
+        app.after_request(add_bridge_cors_headers)
+
+        @app.route("/log", methods=["OPTIONS"])
+        def log_options() -> tuple[str, int]:
+            return "", 204
 
         @app.post("/log")
         def receive_log() -> tuple[str, int]:
-            line = (request.get_data(as_text=True) or "").strip()
+            line = redact_bridge_log_line((request.get_data(as_text=True) or "").strip())
             if line:
+                is_legacy_unibet_discovery = (
+                    line.startswith("[RAW_CONSOLE]")
+                    and "[site:unibet_nl_pokerwebclient]" in line
+                    and "[page:" not in line
+                )
+                if is_legacy_unibet_discovery:
+                    if not self._legacy_unibet_warning_sent:
+                        self._legacy_unibet_warning_sent = True
+                        incoming.put(
+                            "[bridge] ignored stale Unibet userscript output; install bridge userscript "
+                            f"v{BRIDGE_USERSCRIPT_VERSION} from "
+                            "http://127.0.0.1:5000/tampermonkey-bridge.user.js"
+                        )
+                    return "stale userscript ignored", 200
                 incoming.put(line)
                 try:
                     with self._bridge_log_file.open("a", encoding="utf-8") as logfile:
@@ -1597,6 +1893,16 @@ class PreflopApp(tk.Tk):
         def health() -> tuple[str, int]:
             return "ok", 200
 
+        @app.get("/tampermonkey-bridge.user.js")
+        def serve_userscript() -> object:
+            try:
+                source = userscript_file.read_text(encoding="utf-8")
+            except OSError as error:
+                return f"userscript unavailable: {error}", 500
+            response = app.response_class(source, mimetype="application/javascript")
+            response.headers["Cache-Control"] = "no-store"
+            return response
+
         try:
             self._server = make_server("127.0.0.1", 5000, app)
         except OSError as error:
@@ -1605,6 +1911,7 @@ class PreflopApp(tk.Tk):
             self._append_server_log(f"[bridge] startup failed: {error}")
             return
 
+        self._legacy_unibet_warning_sent = False
         self._server_thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._server_thread.start()
         self._server_running = True
@@ -1613,6 +1920,10 @@ class PreflopApp(tk.Tk):
         if self.server_toggle_button is not None:
             self.server_toggle_button.configure(text="Stop Server")
         self._append_server_log("[bridge] server started on http://127.0.0.1:5000/log")
+        self._append_server_log(
+            "[bridge] install/update userscript: "
+            "http://127.0.0.1:5000/tampermonkey-bridge.user.js"
+        )
 
     def _stop_server(self) -> None:
         if not self._server_running:
@@ -1652,10 +1963,311 @@ class PreflopApp(tk.Tk):
     def _extract_cards_from_text(self, text: str) -> list[str]:
         return [match.upper() for match in re.findall(r"\b([2-9TJQKA][CDHScdhs])\b", text)]
 
+    def _reset_unibet_raw_state(self, hand_id: int) -> None:
+        self._unibet_raw_hand_id = hand_id
+        self._unibet_raw_hole_key = None
+        self._unibet_raw_hole_cards = None
+        self._unibet_raw_board_key = None
+        self._unibet_raw_board_cards = []
+        self._unibet_raw_players_count = None
+        self._unibet_raw_hero_sitting_out = None
+        self._unibet_raw_hero_folded = None
+        self._unibet_raw_hero_turn = None
+        self._unibet_raw_pot = None
+        self._unibet_raw_to_call = None
+        self._unibet_raw_minimum_raise = None
+        self._unibet_raw_reset_sent = False
+
+    def _normalize_unibet_compact_cards(self, value: object, expected_count: int) -> list[str] | None:
+        if not isinstance(value, str) or len(value) != expected_count * 2:
+            return None
+        cards: list[str] = []
+        for index in range(0, len(value), 2):
+            code = value[index : index + 2]
+            if not re.match(r"^[2-9TJQKA][cdhs]$", code, re.IGNORECASE):
+                return None
+            cards.append(f"{code[0].upper()}{code[1].lower()}")
+        return cards
+
+    def _unibet_raw_active_players(self, states: object) -> int | None:
+        if not isinstance(states, list):
+            return None
+        active = sum(1 for state in states if state == 1)
+        if active <= 0:
+            return None
+        return max(2, min(10, active))
+
+    def _unibet_raw_pot_size(self, compact_table: object) -> int | None:
+        if not isinstance(compact_table, list):
+            return None
+        total = 0
+        found = False
+        bets = compact_table[3] if len(compact_table) > 3 and isinstance(compact_table[3], list) else []
+        for bet in bets:
+            if isinstance(bet, int) and bet >= 0:
+                total += bet
+                found = True
+        pots = compact_table[4] if len(compact_table) > 4 and isinstance(compact_table[4], list) else []
+        for pot in pots:
+            if isinstance(pot, list) and pot and isinstance(pot[0], int) and pot[0] >= 0:
+                total += pot[0]
+                found = True
+        return total if found else None
+
+    def _unibet_raw_to_call_amount(self, compact_table: object, hero_seat_id: int | None) -> int | None:
+        if not isinstance(compact_table, list) or hero_seat_id is None:
+            return None
+        bets = compact_table[3] if len(compact_table) > 3 and isinstance(compact_table[3], list) else None
+        if bets is None or hero_seat_id < 0 or hero_seat_id >= len(bets) or not isinstance(bets[hero_seat_id], int):
+            return None
+        highest_bet = max((bet for bet in bets if isinstance(bet, int)), default=0)
+        return max(0, highest_bet - bets[hero_seat_id])
+
+    def _unibet_raw_minimum_raise_amount(self, compact_action: object) -> int | None:
+        if not isinstance(compact_action, list) or len(compact_action) <= 3 or not isinstance(compact_action[3], list):
+            return None
+        for option in compact_action[3]:
+            if isinstance(option, list) and len(option) > 1 and option[0] == 3 and isinstance(option[1], int):
+                return max(0, option[1])
+        return 0
+
+    def _unibet_raw_player_names(self, compact_table: object) -> list[str] | None:
+        if not isinstance(compact_table, list) or not compact_table or not isinstance(compact_table[0], str):
+            return None
+        return [name.strip().lower() for name in compact_table[0].split("|")]
+
+    def _unibet_raw_hero_seat_from_names(self, compact_table: object) -> int | None:
+        hero_name = self._hero_name()
+        if not hero_name:
+            return None
+        names = self._unibet_raw_player_names(compact_table)
+        if names is None:
+            return None
+        for seat_id, name in enumerate(names):
+            if name == hero_name:
+                return seat_id
+        return None
+
+    def _unibet_raw_accepts_player_context(
+        self,
+        compact_table: object,
+        player_seat_id: int | None,
+    ) -> bool:
+        if player_seat_id is None:
+            return False
+        hero_seat_id = self._unibet_raw_hero_seat_from_names(compact_table)
+        if hero_seat_id is not None:
+            return player_seat_id == hero_seat_id
+        names = self._unibet_raw_player_names(compact_table)
+        if names is not None:
+            return False
+        return self._hero_seat_id is not None and player_seat_id == self._hero_seat_id
+
+    def _extract_unibet_raw_relax_bodies(self, line: str) -> list[dict[str, object]]:
+        if "[site:unibet_nl_pokerwebclient]" not in line or "<body" not in line:
+            return []
+        bodies: list[dict[str, object]] = []
+        for match in re.finditer(r"<body\b[^>]*>([\s\S]*?)</body>", line, re.IGNORECASE):
+            body_text = html.unescape(match.group(1))
+            try:
+                parsed = json.loads(body_text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                bodies.append(parsed)
+        return bodies
+
+    def _payload_from_unibet_raw_body(self, body: dict[str, object]) -> dict[str, object] | None:
+        tags_raw = body.get("tags")
+        compact_payload = body.get("payLoad")
+        if not isinstance(tags_raw, list) or not isinstance(compact_payload, dict):
+            return None
+        tags = {str(tag) for tag in tags_raw}
+        hand_id = compact_payload.get("hid")
+        if not isinstance(hand_id, int):
+            return None
+
+        is_new_hand = self._unibet_raw_hand_id != hand_id
+        if is_new_hand:
+            self._reset_unibet_raw_state(hand_id)
+
+        payload: dict[str, object] = {"type": "poker_cards", "handId": hand_id}
+        table_id = compact_payload.get("tid")
+        if isinstance(table_id, int):
+            payload["tableId"] = table_id
+        changed = False
+        hole_changed = False
+        if (is_new_hand or "init" in tags) and not self._unibet_raw_reset_sent:
+            payload["reset"] = True
+            payload["board"] = []
+            self._unibet_raw_reset_sent = True
+            self._unibet_raw_board_key = ""
+            changed = True
+
+        player_context = compact_payload.get("p") if isinstance(compact_payload.get("p"), list) else None
+        compact_table = compact_payload.get("c") if isinstance(compact_payload.get("c"), list) else None
+        player_seat_id = (
+            player_context[1]
+            if isinstance(player_context, list) and len(player_context) > 1 and isinstance(player_context[1], int)
+            else None
+        )
+        named_hero_seat_id = self._unibet_raw_hero_seat_from_names(compact_table)
+        hero_seat_id = named_hero_seat_id if named_hero_seat_id is not None else self._hero_seat_id
+        if hero_seat_id is None and self._unibet_raw_accepts_player_context(compact_table, player_seat_id):
+            hero_seat_id = player_seat_id
+        if hero_seat_id is not None:
+            payload["heroSeatId"] = hero_seat_id
+
+        states = compact_table[1] if isinstance(compact_table, list) and len(compact_table) > 1 and isinstance(compact_table[1], list) else None
+        players_count = self._unibet_raw_active_players(states)
+        if players_count is not None and players_count != self._unibet_raw_players_count:
+            self._unibet_raw_players_count = players_count
+            payload["players"] = players_count
+            changed = True
+
+        if states is not None and hero_seat_id is not None and 0 <= hero_seat_id < len(states):
+            hero_state = states[hero_seat_id]
+            hero_sitting_out: bool | None = None
+            if hero_state == 6:
+                hero_sitting_out = True
+            elif ("init" in tags or "deal" in tags) and hero_state == 1:
+                hero_sitting_out = False
+            if hero_sitting_out is not None and hero_sitting_out != self._unibet_raw_hero_sitting_out:
+                self._unibet_raw_hero_sitting_out = hero_sitting_out
+                payload["heroSittingOut"] = hero_sitting_out
+                changed = True
+
+            hero_folded = hero_state in {3, 4}
+            if hero_folded != self._unibet_raw_hero_folded:
+                self._unibet_raw_hero_folded = hero_folded
+                payload["heroFolded"] = hero_folded
+                changed = True
+
+        compact_action = compact_payload.get("d") if isinstance(compact_payload.get("d"), list) else None
+        hero_turn = self._unibet_raw_hero_turn
+        if is_new_hand:
+            hero_turn = False
+        if "pturn" in tags and isinstance(compact_action, list) and compact_action and isinstance(compact_action[0], int):
+            hero_turn = compact_action[0] == hero_seat_id
+        elif (
+            {"flop", "turn", "river", "finished"} & tags
+            or ("act" in tags and isinstance(compact_action, list) and compact_action and compact_action[0] == hero_seat_id)
+        ):
+            hero_turn = False
+        if hero_turn is not None and hero_turn != self._unibet_raw_hero_turn:
+            self._unibet_raw_hero_turn = hero_turn
+            payload["heroTurn"] = hero_turn
+            changed = True
+
+        pot = self._unibet_raw_pot_size(compact_table)
+        if pot is not None and pot != self._unibet_raw_pot:
+            self._unibet_raw_pot = pot
+            payload["pot"] = pot
+            changed = True
+
+        to_call = self._unibet_raw_to_call_amount(compact_table, hero_seat_id)
+        if to_call is not None and to_call != self._unibet_raw_to_call:
+            self._unibet_raw_to_call = to_call
+            payload["toCall"] = to_call
+            changed = True
+
+        if hero_turn is True and "pturn" in tags:
+            minimum_raise = self._unibet_raw_minimum_raise_amount(compact_action)
+            if minimum_raise is not None and minimum_raise != self._unibet_raw_minimum_raise:
+                self._unibet_raw_minimum_raise = minimum_raise
+                payload["minimumRaise"] = minimum_raise
+                changed = True
+
+        hole_cards = (
+            self._normalize_unibet_compact_cards(player_context[3], 2)
+            if isinstance(player_context, list) and len(player_context) > 3
+            else None
+        )
+        is_reliable_hole_frame = bool({"deal", "pturn"} & tags)
+        if hole_cards and is_reliable_hole_frame and self._unibet_raw_accepts_player_context(compact_table, player_seat_id):
+            hole_key = "".join(hole_cards)
+            if hole_key != self._unibet_raw_hole_key:
+                self._unibet_raw_hole_key = hole_key
+                hole_changed = True
+                changed = True
+            self._unibet_raw_hole_cards = hole_cards
+
+        compact_board = compact_table[7] if isinstance(compact_table, list) and len(compact_table) > 7 else None
+        board_cards = None
+        if isinstance(compact_board, str) and len(compact_board) in {6, 8, 10}:
+            board_cards = self._normalize_unibet_compact_cards(compact_board, len(compact_board) // 2)
+        if board_cards:
+            board_key = "".join(board_cards)
+            if board_key != self._unibet_raw_board_key:
+                self._unibet_raw_board_key = board_key
+                changed = True
+            self._unibet_raw_board_cards = board_cards
+
+        if not changed:
+            return None
+
+        if self._unibet_raw_hole_cards and hole_changed:
+            payload["hole"] = list(self._unibet_raw_hole_cards)
+        if "board" not in payload:
+            payload["board"] = list(self._unibet_raw_board_cards)
+        if self._unibet_raw_hero_sitting_out is not None and "heroSittingOut" not in payload:
+            payload["heroSittingOut"] = self._unibet_raw_hero_sitting_out
+        if self._unibet_raw_hero_folded is not None and "heroFolded" not in payload:
+            payload["heroFolded"] = self._unibet_raw_hero_folded
+        if self._unibet_raw_hero_turn is not None and "heroTurn" not in payload:
+            payload["heroTurn"] = self._unibet_raw_hero_turn
+        return payload
+
+    def _process_unibet_raw_relax_line(self, line: str) -> bool:
+        applied = False
+        for body in self._extract_unibet_raw_relax_bodies(line):
+            payload = self._payload_from_unibet_raw_body(body)
+            if payload is None:
+                continue
+            parsed = self._parse_tagged_bridge_payload(payload)
+            if parsed is None:
+                self._log_app_action("process_console_line_skip", reason="invalid_unibet_raw_payload", payload=payload)
+                continue
+            self._log_app_action("process_console_line_accept", source="unibet_raw_relax", payload=payload)
+            (
+                hole_cards,
+                board_cards,
+                players_count,
+                reset_state,
+                hand_id,
+                table_id,
+                hero_user_id,
+                hero_seat_id,
+                hero_sitting_out,
+                hero_folded,
+                pot_chips,
+                to_call_chips,
+                minimum_raise_chips,
+                hero_turn,
+            ) = parsed
+            self._apply_external_cards(
+                hole_cards,
+                board_cards,
+                players_count,
+                reset_state,
+                hand_id=hand_id,
+                table_id=table_id,
+                hero_user_id=hero_user_id,
+                hero_seat_id=hero_seat_id,
+                hero_sitting_out=hero_sitting_out,
+                hero_folded=hero_folded,
+                pot_chips=pot_chips,
+                to_call_chips=to_call_chips,
+                minimum_raise_chips=minimum_raise_chips,
+                hero_turn=hero_turn,
+            )
+            applied = True
+        return applied
+
     def _parse_tagged_bridge_payload(
         self,
         payload: object,
-    ) -> tuple[list[str], list[str] | None, int | None, bool, int | None, int | None, int | None, bool | None] | None:
+    ) -> tuple[list[str], list[str] | None, int | None, bool, int | None, str | None, int | None, int | None, bool | None, bool | None, int | None, int | None, int | None, bool | None] | None:
         parsed = parse_bridge_payload(payload)
         if parsed is None:
             return None
@@ -1665,9 +2277,15 @@ class PreflopApp(tk.Tk):
             parsed.players_count,
             parsed.reset_state,
             parsed.hand_id,
+            parsed.table_id,
             parsed.hero_user_id,
             parsed.hero_seat_id,
             parsed.hero_sitting_out,
+            parsed.hero_folded,
+            parsed.pot_chips,
+            parsed.to_call_chips,
+            parsed.minimum_raise_chips,
+            parsed.hero_turn,
         )
 
     def _extract_player_user_id(self, player: object) -> int | None:
@@ -1773,6 +2391,8 @@ class PreflopApp(tk.Tk):
         plain = re.sub(r"^\[[A-Z]+\]\s*", "", line)
 
         if not plain.startswith(BRIDGE_TAG):
+            if self._process_unibet_raw_relax_line(line):
+                return
             self._log_app_action("process_console_line_skip", reason="not_tagged")
             return
 
@@ -1792,16 +2412,37 @@ class PreflopApp(tk.Tk):
 
         self._append_server_log(f"[bridge] accepted tagged payload: {payload!r}")
         self._log_app_action("process_console_line_accept", payload=payload)
-        hole_cards, board_cards, players_count, reset_state, hand_id, hero_user_id, hero_seat_id, hero_sitting_out = parsed
+        (
+            hole_cards,
+            board_cards,
+            players_count,
+            reset_state,
+            hand_id,
+            table_id,
+            hero_user_id,
+            hero_seat_id,
+            hero_sitting_out,
+            hero_folded,
+            pot_chips,
+            to_call_chips,
+            minimum_raise_chips,
+            hero_turn,
+        ) = parsed
         self._apply_external_cards(
             hole_cards,
             board_cards,
             players_count,
             reset_state,
             hand_id=hand_id,
+            table_id=table_id,
             hero_user_id=hero_user_id,
             hero_seat_id=hero_seat_id,
             hero_sitting_out=hero_sitting_out,
+            hero_folded=hero_folded,
+            pot_chips=pot_chips,
+            to_call_chips=to_call_chips,
+            minimum_raise_chips=minimum_raise_chips,
+            hero_turn=hero_turn,
         )
 
     def _extract_json_from_console_line(self, line: str) -> dict[str, object] | None:
@@ -1831,7 +2472,7 @@ class PreflopApp(tk.Tk):
     def _aggression_label(self) -> str:
         recent = self._recent_actions[-8:]
         if not recent:
-            return "Low"
+            return "Unknown"
         pressure = sum(1 for action in recent if action in {"bet", "raise", "allin"})
         if pressure >= 4:
             return "High"
@@ -2305,6 +2946,21 @@ class PreflopApp(tk.Tk):
             self._capture_advice_snapshot("panel_wait")
             return
 
+        if self._hero_turn is False:
+            self.training_status_var.set("Training: waiting for hero turn")
+            self.strategy_quick_var.set("WAIT")
+            self.strategy_quick_sub_var.set("Another player is acting")
+            color = self._strategy_quick_color("wait")
+            if self.strategy_quick_label is not None:
+                self.strategy_quick_label.configure(fg=color)
+            if self.strategy_quick_sub_label is not None:
+                self.strategy_quick_sub_label.configure(fg=color)
+            self.strategy_advice_var.set(
+                "WAIT FOR YOUR TURN.\n"
+                "The table state is still updating; advice will refresh when action reaches you."
+            )
+            return
+
         self.training_status_var.set("Training: active")
 
         preflop = evaluate_preflop(self.selected[0].code, self.selected[1].code)
@@ -2314,6 +2970,20 @@ class PreflopApp(tk.Tk):
         pot_odds = (to_call / (pot + to_call)) if (to_call > 0 and pot + to_call > 0) else None
         board_count = sum(1 for card in self.board_cards.values() if card is not None)
         board_codes = [card.code for card in self.board_cards.values() if card is not None]
+        if board_count >= 3 and "..." in self.equity_var.get():
+            self.training_status_var.set("Training: calculating equity")
+            self.strategy_quick_var.set("WAIT")
+            self.strategy_quick_sub_var.set("Calculating equity")
+            color = self._strategy_quick_color("wait")
+            if self.strategy_quick_label is not None:
+                self.strategy_quick_label.configure(fg=color)
+            if self.strategy_quick_sub_label is not None:
+                self.strategy_quick_sub_label.configure(fg=color)
+            self.strategy_advice_var.set(
+                "CALCULATING POSTFLOP EQUITY.\n"
+                "Advice will refresh as soon as the current board calculation finishes."
+            )
+            return
         made_hand = describe_current_hand([self.selected[0].code, self.selected[1].code], board_codes) if board_count >= 3 else None
         made_hand_lower = made_hand.lower() if isinstance(made_hand, str) else ""
         paired_board = len(board_codes) != len({code[0] for code in board_codes}) if board_codes else False
@@ -2322,123 +2992,94 @@ class PreflopApp(tk.Tk):
             suit_counts[code[1]] = suit_counts.get(code[1], 0) + 1
         max_suit_count = max(suit_counts.values()) if suit_counts else 0
         flush_heavy_board = max_suit_count >= 3
-        overbet_pressure = pot > 0 and to_call >= max(1, pot)
-        large_bet_pressure = pot > 0 and to_call >= max(1, int(pot * 0.6))
-        weak_action = aggression == "Low" and to_call == 0
-        min_raise = self._minimum_raise_chips if isinstance(self._minimum_raise_chips, int) and self._minimum_raise_chips > 0 else 2
-        preflop_shove_threshold = max(12, min_raise * 8)
         preflop_allin_pressure = self._street == "preflop" and (
             self._allin_pressure
-            or to_call >= preflop_shove_threshold
-            or (to_call >= max(1, pot) and pot >= preflop_shove_threshold // 2)
+            or (to_call >= 12 and pot_odds is not None and pot_odds >= 0.40)
         )
 
         headline = "PLAY SOLID."
         details: list[str] = []
+        quick_math_text: str | None = None
 
         if self._street == "preflop":
             if self._hero_acted_preflop and to_call == 0:
                 headline = "PRE-FLOP DECISION MADE. WAIT FOR FLOP."
                 details.append("You already acted preflop and there is no new price to call. Let the flop arrive before changing plans.")
             elif preflop_allin_pressure and to_call > 0:
-                if preflop.score >= 82:
-                    headline = "PREFLOP SHOVE DETECTED. CALL OR RE-JAM."
-                    details.append("This is strong enough to continue against most all-in ranges.")
-                elif equity is not None and pot_odds is not None and equity >= pot_odds + 0.08 and preflop.score >= 65:
-                    headline = "PREFLOP SHOVE DETECTED. CALL CAREFULLY."
-                    details.append(
-                        f"Exploitative call: equity about {self._format_percent(equity)} vs required {self._format_percent(pot_odds)}."
-                    )
+                if preflop.tier == "Premium":
+                    headline = "HEAVY PREFLOP PRESSURE. CALL OR RE-JAM."
+                    details.append("A premium hand can continue, though stack depth and the opponent's range still affect the best line.")
                 else:
-                    headline = "PREFLOP SHOVE DETECTED. FOLD MOST MARGINAL HANDS."
+                    headline = "HEAVY PREFLOP PRESSURE. FOLD WITHOUT A PREMIUM."
                     if equity is not None and pot_odds is not None:
                         details.append(
-                            f"Do not punt: equity about {self._format_percent(equity)} vs required {self._format_percent(pot_odds)}."
+                            f"Random-hand equity about {self._format_percent(equity)} is not a valid stand-in for the range making this oversized raise."
                         )
-                    details.append("Population preflop jams are under-bluffed at these stakes, so fold weak offsuit broadway/trash.")
-            elif preflop.score >= 75:
-                headline = "MONSTER HAND. BET BIG."
-                details.append("Premium preflop range. Population calls too much here, so print value immediately.")
-            elif preflop.score >= 60:
-                headline = "GOOD HAND. RAISE."
-                details.append("You are ahead of the junk people show up with. Raise and take control instead of inviting nonsense in.")
-            elif preflop.score >= 45:
+                    details.append("Without effective stacks or a specific read, the conservative default is to fold non-premium hands to extreme pressure.")
+            elif preflop.tier == "Premium":
+                headline = "PREMIUM HAND. RAISE FOR VALUE."
+                details.append("This belongs near the top of the preflop range. Raise for value rather than using postflop bet language.")
+            elif preflop.tier == "Strong":
+                if to_call > 0:
+                    headline = "STRONG HAND. CALL OR 3-BET CAREFULLY."
+                    details.append("This can continue against ordinary action, but facing a raise is not the same as opening an untouched pot.")
+                else:
+                    headline = "STRONG HAND. RAISE."
+                    details.append("This is a clear value raise in an ordinary unopened pot, while position still matters.")
+            elif preflop.tier == "Playable":
                 if to_call > 0:
                     headline = "MARGINAL HAND. USUALLY FOLD."
-                    details.append("This is exactly the kind of hand people convince themselves to peel with and regret later.")
+                    details.append("This can open profitably in some positions, but it is not automatically strong enough to continue facing a raise.")
                 else:
                     headline = "PLAYABLE HAND. OPEN SMALL."
-                    details.append("If you are first in, make a small open. Do not bloat the pot with junk from bad position.")
+                    details.append("Open small only when the action is unopened and your position permits it; this is not a premium hand.")
+            elif preflop.tier == "Speculative":
+                if to_call > 0:
+                    headline = "SPECULATIVE HAND. FOLD TO PRESSURE."
+                    details.append("Do not pay a raise with this hand without position, stack depth, and a specific exploit supporting the call.")
+                else:
+                    headline = "SPECULATIVE HAND. CHECK IF FREE, OTHERWISE FOLD."
+                    details.append("Without reliable position information, the conservative default is to take a free option or fold.")
             else:
                 headline = "TRASH HAND. FOLD."
                 details.append("Without a real steal spot, this is not worth opening.")
         else:
-            if board_count == 5 and to_call > 0 and self._is_high_card_only(made_hand_lower):
-                headline = "RIVER AIR. FOLD."
-                if made_hand:
-                    details.append(f"Your made hand is only {made_hand.lower()}. Do not pay off with air just because the price looks close.")
-            elif board_count == 5 and to_call == 0 and self._is_high_card_only(made_hand_lower):
-                headline = "RIVER AIR. CHECK."
-                if made_hand:
-                    details.append(f"Your made hand is only {made_hand.lower()}. Take the free card/showdown instead of forcing action.")
-            elif equity is not None and equity >= 0.75:
-                headline = "MONSTER HAND. BET BIG."
-                details.append("You are way ahead of one-pair nonsense. Stop trapping and start charging.")
-            elif equity is not None and equity >= 0.55 and aggression == "Low":
-                headline = "STRONG HAND. CHECK OR BET SMALL."
-                details.append("Nobody seems to have much. Overbetting just folds out worse hands, so keep them in with a small size.")
-            elif equity is not None and equity >= 0.55:
-                headline = "VALUE HAND. BET SMALL TO MEDIUM."
-                details.append("You are probably good, but the action says this is not a spot to torch stacks with one pair.")
-
-            if board_count == 5 and to_call == 0 and equity is not None:
-                if equity >= 0.7:
-                    headline = "VALUE HAND. BET SMALL TO MEDIUM."
-                    details.append("You have a real river value spot. Bet small to get paid by worse one-pair hands and bluff-catchers.")
-                elif equity >= 0.5:
-                    headline = "SHOWDOWN VALUE. BET SMALL OR CHECK."
-                    details.append("Thin river value is available, but keep sizes honest and do not force a huge pot.")
-
-            if pot_odds is not None and equity is not None:
-                if equity < pot_odds - 0.08 and to_call > 0:
-                    headline = "THEY BET BIG, YOU GOT SHIT. FOLD."
-                    details.append(
-                        f"Your equity is about {self._format_percent(equity)} and pot odds need about {self._format_percent(pot_odds)}."
+            profile = analyze_postflop([self.selected[0].code, self.selected[1].code], board_codes)
+            if to_call > 0 and pot_odds is not None:
+                headline, reason, required_equity = _recommend_facing_postflop_bet(
+                    profile,
+                    equity,
+                    pot_odds,
+                    players,
+                )
+                details.append(reason)
+                details.append(
+                    f"Pot odds require {self._format_percent(pot_odds)}; random-hand equity is "
+                    f"{self._format_percent(equity)}, and the conservative betting-range target is "
+                    f"{self._format_percent(required_equity)}."
+                )
+                if profile.strong_draw or profile.gutshot:
+                    quick_math_text = (
+                        f"DRAW {self._format_percent(profile.next_card_draw_equity)} | "
+                        f"PRICE {self._format_percent(pot_odds)}"
                     )
-                elif abs(equity - pot_odds) <= 0.06 and to_call > 0:
-                    headline = "BLUFF CATCHER. MAYBE CALL, MAYBE FOLD."
                     details.append(
-                        f"Close spot: equity about {self._format_percent(equity)} vs pot odds about {self._format_percent(pot_odds)}."
-                    )
-                    details.append("Live-read version: if this sizing feels weird and value-heavy, fold more. If it looks stabby, flick in the call.")
-                elif equity > pot_odds + 0.12 and to_call > 0:
-                    headline = "YOU'RE AHEAD. CALL OR RAISE SMALL."
-                    details.append(
-                        f"Math is on your side: equity about {self._format_percent(equity)} vs pot odds about {self._format_percent(pot_odds)}."
-                    )
-                elif equity >= pot_odds and to_call > 0:
-                    headline = "PRICE IS OKAY. CALL ONLY WITH REAL SHOWDOWN VALUE."
-                    details.append(
-                        f"You are getting roughly the right price: equity about {self._format_percent(equity)}."
+                        f"The immediate draw has about {self._format_percent(profile.next_card_draw_equity)} "
+                        "chance to improve on the next card before a small implied-odds allowance."
                     )
                 else:
-                    details.append("Pot odds do not justify paying off without stronger showdown value.")
-            elif to_call > 0 and aggression == "High":
-                headline = "THEY'RE PUSHING HARD. FOLD MOST TRASH."
-                details.append("Without a strong made hand or a real draw, this is a bad hero spot.")
+                    quick_math_text = (
+                        f"PRICE {self._format_percent(pot_odds)} | "
+                        f"RANGE {self._format_percent(required_equity)}"
+                    )
+            else:
+                headline, reason = _recommend_when_checked_to(profile)
+                details.append(reason)
 
-            if board_count >= 3 and equity is not None and equity < 0.35 and to_call == 0:
-                headline = "NOT MUCH THERE. CHECK."
-                details.append("No reason to torch chips with weak showdown value into a developed board.")
-
-            if weak_action and board_count < 5 and equity is not None and equity >= 0.45 and headline not in {"MONSTER HAND. BET BIG.", "VALUE HAND. BET SMALL TO MEDIUM.", "YOU'RE AHEAD. CHECK OR BET SMALL."}:
-                headline = "NOBODY SEEMS TO HAVE SHIT. STAB SMALL OR CHECK."
-                details.append("This line looks capped. A small stab works often, but checking back is fine if your hand has showdown value.")
-
-            if overbet_pressure:
-                details.append("Overbet pressure is population-biased toward nutted hands or obvious panic bluffs. Continue only with real equity or clear bluff-catchers.")
-            elif large_bet_pressure:
-                details.append("Big sizing usually means they want folds. Respect it more on wet boards and call lighter on disconnected boards.")
+            if pot_odds is not None and pot_odds >= 0.33:
+                details.append("This is overbet-level call pressure, so the continuing range needs substantially more than raw pot odds.")
+            elif pot_odds is not None and pot_odds >= 0.28:
+                details.append("The large call price strengthens the range assumption and reduces marginal bluff catches.")
 
             if paired_board:
                 details.append("Paired board: trips/full-house stories are over-represented in big bets, but weak players also stab these boards too wide.")
@@ -2488,7 +3129,9 @@ class PreflopApp(tk.Tk):
 
         quick_primary = self._strategy_quick_primary(recommendation)
         quick_secondary = (
-            f"EQ {self._format_percent(equity)} | ODDS {self._format_percent(pot_odds)}"
+            quick_math_text
+            if quick_math_text is not None
+            else f"RAND {self._format_percent(equity)} | PRICE {self._format_percent(pot_odds)}"
             if equity is not None and pot_odds is not None and to_call > 0
             else f"{street.upper()} | {players}P"
         )
@@ -2520,15 +3163,22 @@ class PreflopApp(tk.Tk):
         players_count: int | None = None,
         reset_state: bool = False,
         hand_id: int | None = None,
+        table_id: str | None = None,
         hero_user_id: int | None = None,
         hero_seat_id: int | None = None,
         hero_sitting_out: bool | None = None,
+        hero_folded: bool | None = None,
+        pot_chips: int | None = None,
+        to_call_chips: int | None = None,
+        minimum_raise_chips: int | None = None,
+        hero_turn: bool | None = None,
     ) -> None:
-        if self._hero_folded_waiting_for_new_hole and not hole_cards:
-            self._update_strategy_panel()
-            return
+        if hero_folded is True:
+            self._hero_folded_waiting_for_new_hole = True
+        elif hero_folded is False:
+            self._hero_folded_waiting_for_new_hole = False
 
-        accepting_fresh_hole = self._hero_folded_waiting_for_new_hole or self._awaiting_hero_hole_after_reset
+        accepting_fresh_hole = self._awaiting_hero_hole_after_reset
 
         self._log_app_action(
             "apply_external_cards_start",
@@ -2537,11 +3187,32 @@ class PreflopApp(tk.Tk):
             players_count=players_count,
             reset_state=reset_state,
             hand_id=hand_id,
+            table_id=table_id,
             hero_user_id=hero_user_id,
             hero_seat_id=hero_seat_id,
             hero_sitting_out=hero_sitting_out,
+            hero_folded=hero_folded,
+            pot_chips=pot_chips,
+            to_call_chips=to_call_chips,
+            minimum_raise_chips=minimum_raise_chips,
+            hero_turn=hero_turn,
         )
 
+        incoming_table_id = table_id.strip() if isinstance(table_id, str) and table_id.strip() else None
+        locked_table_id = self.__dict__.get("_bridge_card_table_id")
+        current_table_id = self.__dict__.get("_current_table_id")
+        if incoming_table_id is not None and locked_table_id is not None and incoming_table_id != locked_table_id:
+            self._append_server_log(
+                f"[bridge] ignored payload for table {incoming_table_id}; locked to table {locked_table_id}"
+            )
+            self._log_app_action(
+                "apply_external_cards_skip",
+                reason="bridge_table_mismatch",
+                table_id=incoming_table_id,
+                locked_table_id=locked_table_id,
+                hand_id=hand_id,
+            )
+            return
         if hand_id is not None:
             if self._current_hand_id is not None and hand_id < self._current_hand_id:
                 self._append_server_log(f"[bridge] ignored stale payload for hand {hand_id} < current {self._current_hand_id}")
@@ -2557,6 +3228,8 @@ class PreflopApp(tk.Tk):
             self._hero_seat_id = hero_seat_id
         if hero_sitting_out is not None:
             self._hero_sitting_out = hero_sitting_out
+        if hero_turn is not None:
+            self._hero_turn = hero_turn
 
         parsed_hole: list[Card] = []
         parsed_board: list[Card] = []
@@ -2569,8 +3242,19 @@ class PreflopApp(tk.Tk):
             self._street = "preflop"
             self._pot_chips = None
             self._to_call_chips = None
+            self._minimum_raise_chips = None
+            self._hero_turn = None
             self._strategy_players_count = None
             self._recent_actions = []
+
+        if pot_chips is not None:
+            self._pot_chips = pot_chips
+        if to_call_chips is not None:
+            self._to_call_chips = to_call_chips
+        if minimum_raise_chips is not None:
+            self._minimum_raise_chips = minimum_raise_chips
+        if hero_turn is not None:
+            self._hero_turn = hero_turn
 
         board_count = sum(1 for card in self.board_cards.values() if card is not None)
 
@@ -2586,16 +3270,25 @@ class PreflopApp(tk.Tk):
                 self._append_server_log("[bridge] ignored hole update with duplicate or incomplete cards")
                 self._log_app_action("apply_external_cards_skip", reason="invalid_hole_set", parsed_hole=[card.code for card in parsed_hole])
                 return
+            if incoming_table_id is not None and self.__dict__.get("_bridge_card_table_id") is None:
+                self._bridge_card_table_id = incoming_table_id
+                self._set_tracker_table_id(incoming_table_id)
+                self._log_app_action("bridge_table_locked", table_id=incoming_table_id, hand_id=hand_id)
 
             incoming_hole_codes = [card.code for card in parsed_hole]
             existing_hole_codes = [card.code for card in self.selected]
 
             # Keep hole cards immutable within a hand to prevent noisy payload overwrites.
-            if board_count > 0 and len(existing_hole_codes) == 2 and not accepting_fresh_hole:
-                self._append_server_log("[bridge] ignored hole update after board started")
+            if (
+                board_count > 0
+                and len(existing_hole_codes) == 2
+                and incoming_hole_codes != existing_hole_codes
+                and not accepting_fresh_hole
+            ):
+                self._append_server_log("[bridge] ignored conflicting hole update after board started")
                 self._log_app_action(
                     "apply_external_cards_skip",
-                    reason="hole_after_board_started",
+                    reason="conflicting_hole_after_board_started",
                     incoming_hole=incoming_hole_codes,
                     existing_hole=existing_hole_codes,
                 )
@@ -2654,8 +3347,19 @@ class PreflopApp(tk.Tk):
                         break
                     self.board_cards[next_slot] = card
 
+            applied_board_count = sum(1 for card in self.board_cards.values() if card is not None)
+            if applied_board_count >= 5:
+                self._street = "river"
+            elif applied_board_count == 4:
+                self._street = "turn"
+            elif applied_board_count == 3:
+                self._street = "flop"
+            else:
+                self._street = "preflop"
+
         if players_count is not None:
             self.players_var.set(players_count)
+            self._strategy_players_count = players_count
 
         used_codes = {card.code for card in self.selected}
         board_used = {card.code for card in self.board_cards.values() if card is not None}
@@ -2856,7 +3560,11 @@ class PreflopApp(tk.Tk):
             grip.bind("<ButtonRelease-1>", self._finish_resize)
 
     def _restore_override_redirect(self, _event: tk.Event | None = None) -> None:
-        if not self._use_custom_chrome or self.state() != "normal":
+        if (
+            self._custom_chrome_backend != "override_redirect"
+            or not self._custom_chrome_ready
+            or self.state() != "normal"
+        ):
             return
 
         def restore_chrome() -> None:
@@ -2881,7 +3589,7 @@ class PreflopApp(tk.Tk):
         self.geometry(f"+{new_x}+{new_y}")
 
     def _minimize_window(self) -> None:
-        if self._use_custom_chrome:
+        if self._custom_chrome_backend == "override_redirect":
             self._is_minimized = True
             self.overrideredirect(False)
         self.iconify()
@@ -3582,6 +4290,7 @@ class PreflopApp(tk.Tk):
                 self.equity_var.set("Total equity: -")
                 if self.equity_label is not None:
                     self.equity_label.configure(fg=FG_MAIN)
+                self._update_strategy_panel()
                 return
             self.odds_cache[key] = (win, tie, loss)
 
@@ -3593,6 +4302,7 @@ class PreflopApp(tk.Tk):
         self.equity_var.set(f"Total equity: {equity * 100:.1f}%")
         if self.equity_label is not None:
             self.equity_label.configure(fg=self._score_color(int(equity * 100)))
+        self._update_strategy_panel()
 
     def _set_board_slot(self, slot: str, card: Card | None) -> None:
         self.board_cards[slot] = card
@@ -3651,7 +4361,11 @@ class PreflopApp(tk.Tk):
             self.board_cards["river"].code if self.board_cards["river"] is not None else "",
         ]
         self.current_hand_var.set(
-            f"Current hand: {describe_current_hand([self.selected[0].code, self.selected[1].code], board_codes)}"
+            "Current hand: "
+            + _describe_current_hand_context(
+                [self.selected[0].code, self.selected[1].code],
+                board_codes,
+            )
         )
         prefix = "Replaced oldest hole card. " if replaced else ""
         self.advice_var.set(f"Advice: {prefix}{result.advice} ({result.reason})")
@@ -3674,8 +4388,20 @@ class PreflopApp(tk.Tk):
 
 
 def main() -> None:
-    app = PreflopApp()
-    app.mainloop()
+    use_custom_chrome = "--standard-window" not in sys.argv
+    print("Starting Poker Hand Trainer...", flush=True)
+    print(
+        "Using custom borderless window chrome." if use_custom_chrome else "Using standard OS window chrome.",
+        flush=True,
+    )
+    try:
+        app = PreflopApp(use_custom_chrome=use_custom_chrome)
+        print("Poker Hand Trainer window initialized.", flush=True)
+        app.mainloop()
+    except Exception:
+        print("Poker Hand Trainer failed to start:", file=sys.stderr, flush=True)
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":
