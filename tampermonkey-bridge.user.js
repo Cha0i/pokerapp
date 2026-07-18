@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokerOdds Tagged Bridge
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.8
 // @description  Forward poker console messages to local PokerOdds bridge
 // @downloadURL  http://127.0.0.1:5000/tampermonkey-bridge.user.js
 // @updateURL    http://127.0.0.1:5000/tampermonkey-bridge.user.js
@@ -21,7 +21,7 @@
 (function () {
     'use strict';
 
-    var SCRIPT_VERSION = '2.4';
+    var SCRIPT_VERSION = '2.8';
     var BRIDGE_URLS = ['http://127.0.0.1:5000/log', 'http://localhost:5000/log'];
     var currentBridgeUrlIndex = 0;
     var BRIDGE_TAG = 'TM_BRIDGE:';
@@ -133,7 +133,8 @@
         holeSentForHand: false,
         heroUserId: null,
         heroSeatId: null,
-        heroSittingOut: null
+        heroSittingOut: null,
+        heroFolded: null
     };
     var relaxHandState = {
         handId: null,
@@ -298,23 +299,49 @@
         return false;
     }
 
+    var IGNORED_STRATEGY_ACTIONS = {
+        ping: true,
+        pong: true,
+        extendedconnections: true,
+        chatmessage: true,
+        missionprogress: true
+    };
+
+    function strategyEventsFromArgs(args) {
+        var events = [];
+        for (var i = 0; i < args.length; i += 1) {
+            var arg = args[i];
+            if (!arg || typeof arg !== 'object' || Array.isArray(arg.updates)) {
+                continue;
+            }
+            var action = typeof arg.action === 'string' ? arg.action.trim().toLowerCase() : '';
+            if (action && IGNORED_STRATEGY_ACTIONS[action]) {
+                continue;
+            }
+            if (isPokerStrategyCandidate(arg, [])) {
+                events.push(arg);
+            }
+        }
+        return events;
+    }
+
     function sendStrategyEventLines(source, args) {
         if (!ENABLE_STRATEGY_EVENT_MIRROR || ENABLE_RAW_MIRROR) {
             return;
         }
-        for (var i = 0; i < args.length; i += 1) {
-            var arg = args[i];
-            if (!arg || typeof arg !== 'object') {
-                continue;
-            }
-            if (!isPokerStrategyCandidate(arg, [])) {
-                continue;
-            }
+        var events = strategyEventsFromArgs(args);
+        for (var i = 0; i < events.length; i += 1) {
+            var arg = events[i];
             var text = safeStringify(arg);
             if (text.length > 2200) {
                 text = text.slice(0, 2200) + '...[truncated]';
             }
-            sendLine(RAW_TAG + ' [site:' + currentSiteKey() + '] [' + source + ':POKER_EVENT] event | ' + text);
+            sendLine(
+                RAW_TAG +
+                ' [site:' + currentSiteKey() + ']' +
+                ' [page:' + pageContext() + ']' +
+                ' [' + source + ':POKER_EVENT] event | ' + text
+            );
         }
     }
 
@@ -463,11 +490,21 @@
         sendLine(formatRawLine(source, level, args));
     }
 
+    function payloadWithBridgeContext(payload) {
+        var contextualPayload = {};
+        Object.keys(payload || {}).forEach(function (key) {
+            contextualPayload[key] = payload[key];
+        });
+        contextualPayload.site = currentSiteKey();
+        contextualPayload.bridgeVersion = SCRIPT_VERSION;
+        return contextualPayload;
+    }
+
     function sendPayload(payload) {
         if (!payload) {
             return;
         }
-        var key = JSON.stringify(payload);
+        var key = JSON.stringify(payloadWithBridgeContext(payload));
         if (key === lastSentKey) {
             return;
         }
@@ -681,6 +718,7 @@
         handState.holeSentForHand = false;
         handState.heroSeatId = null;
         handState.heroSittingOut = null;
+        handState.heroFolded = null;
     }
 
     function payloadFromRelaxBody(messageBody) {
@@ -804,7 +842,12 @@
         }
 
         var holeCards = playerContext ? normalizeCompactCards(playerContext[3], 2) : null;
-        var isReliableHoleFrame = tags.indexOf('deal') !== -1 || tags.indexOf('pturn') !== -1;
+        var isReliableHoleFrame = (
+            tags.indexOf('deal') !== -1 ||
+            tags.indexOf('pturn') !== -1 ||
+            isNewHand ||
+            namedHeroSeatId !== null
+        );
         if (holeCards && isReliableHoleFrame && relaxAcceptsPlayerContext(compactTable, playerSeatId)) {
             var holeKey = holeCards.join('');
             if (holeKey !== relaxHandState.holeKey) {
@@ -1085,6 +1128,9 @@
         if (typeof handState.heroSittingOut === 'boolean') {
             payload.heroSittingOut = handState.heroSittingOut;
         }
+        if (typeof handState.heroFolded === 'boolean') {
+            payload.heroFolded = handState.heroFolded;
+        }
         return payload;
     }
 
@@ -1147,6 +1193,7 @@
         }
 
         handState.holeSentForHand = true;
+        handState.heroFolded = false;
         var payload = { type: 'poker_cards', hole: cards };
         if (playersCount !== null) {
             payload.players = playersCount;
@@ -1227,6 +1274,7 @@
                 }
                 handState.boardCount = 0;
                 handState.holeSentForHand = false;
+                handState.heroFolded = false;
                 var startPayload = { type: 'poker_cards', reset: true, board: [] };
                 if (playersCount !== null) {
                     startPayload.players = playersCount;
@@ -1240,6 +1288,7 @@
                     handState.heroUserId = authenticatedUserId;
                     handState.heroSeatId = null;
                     handState.heroSittingOut = null;
+                    handState.heroFolded = null;
                 }
             }
 
@@ -1249,6 +1298,9 @@
             }
 
             if (action === 'fold') {
+                if (typeof handState.heroSeatId === 'number' && value.seatId === handState.heroSeatId) {
+                    handState.heroFolded = true;
+                }
                 var foldedCount = markSeatFolded(value.seatId, handId);
                 if (foldedCount !== null) {
                     return attachContext({ type: 'poker_cards', players: foldedCount }, handId);
@@ -1270,6 +1322,7 @@
                 var holeCards = extractCardsFromValue(value.cards, 2);
                 if (holeCards && holeCards.length === 2) {
                     handState.holeSentForHand = true;
+                    handState.heroFolded = false;
                     var holePayload = { type: 'poker_cards', hole: holeCards };
                     if (playersCount !== null) {
                         holePayload.players = playersCount;
@@ -1318,6 +1371,7 @@
 
                     if (chosen) {
                         handState.holeSentForHand = true;
+                        handState.heroFolded = false;
                         if (chosen.userId) {
                             handState.heroUserId = chosen.userId;
                         }
@@ -1362,15 +1416,54 @@
         return null;
     }
 
-    function payloadFromArgs(args) {
+    function cloneEventWithInheritedHandId(event, handId) {
+        if (!event || typeof event !== 'object') {
+            return event;
+        }
+        if (typeof handId !== 'number' || typeof event.handId === 'number') {
+            return event;
+        }
+        var cloned = {};
+        var keys = Object.keys(event);
+        for (var i = 0; i < keys.length; i += 1) {
+            cloned[keys[i]] = event[keys[i]];
+        }
+        cloned.handId = handId;
+        return cloned;
+    }
+
+    function payloadsFromArgs(args) {
+        var payloads = [];
         for (var i = 0; i < args.length; i += 1) {
             var arg = args[i];
             if (arg && typeof arg === 'object') {
+                if (Array.isArray(arg.updates)) {
+                    var inheritedHandId = typeof arg.handId === 'number' ? arg.handId : null;
+                    for (var u = 0; u < arg.updates.length; u += 1) {
+                        var updatePayload = walkForPayload(
+                            cloneEventWithInheritedHandId(arg.updates[u], inheritedHandId),
+                            [],
+                            null
+                        );
+                        if (updatePayload) {
+                            payloads.push(updatePayload);
+                        }
+                    }
+                    continue;
+                }
                 var objectPayload = walkForPayload(arg, [], null);
                 if (objectPayload) {
-                    return objectPayload;
+                    payloads.push(objectPayload);
                 }
             }
+        }
+        return payloads;
+    }
+
+    function payloadFromArgs(args) {
+        var payloads = payloadsFromArgs(args);
+        if (payloads.length > 0) {
+            return payloads[0];
         }
         return null;
     }
@@ -1385,6 +1478,15 @@
             }
         }
         return null;
+    }
+
+    function sendTaggedLineWithContext(line) {
+        try {
+            var payload = JSON.parse(line.trim().slice(BRIDGE_TAG.length));
+            sendPayload(payload);
+        } catch (_) {
+            localDiagnostic('warn', 'ignored invalid tagged bridge JSON');
+        }
     }
 
     function sendPokerCards(payload) {
@@ -1415,7 +1517,7 @@
             return;
         }
 
-        sendLine(BRIDGE_TAG + JSON.stringify(safePayload));
+        sendPayload(safePayload);
     }
 
     function hookConsole(consoleObj, sourceLabel) {
@@ -1441,12 +1543,12 @@
 
                 var tagged = taggedLineFromArgs(args);
                 if (tagged) {
-                    sendLine(tagged);
+                    sendTaggedLineWithContext(tagged);
                 }
 
-                var payload = payloadFromArgs(args);
-                if (payload) {
-                    sendPayload(payload);
+                var payloads = payloadsFromArgs(args);
+                for (var i = 0; i < payloads.length; i += 1) {
+                    sendPayload(payloads[i]);
                 }
             };
         });

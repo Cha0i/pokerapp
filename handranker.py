@@ -33,6 +33,7 @@ class PostflopProfile:
     draw_outs: int
     cards_to_come: int
     plays_board: bool
+    board_straight_pressure: bool
 
     @property
     def strong_draw(self) -> bool:
@@ -465,7 +466,13 @@ def analyze_postflop(hero_cards: Sequence[str], board_cards: Sequence[str]) -> P
                 pair_strength = "weak_pair"
     elif category == "two_pair":
         board_pairs = sum(1 for count in board_counts.values() if count >= 2)
-        pair_strength = "board_two_pair" if board_pairs >= 2 and not (set(hero_ranks) & set(board_ranks)) else "two_pair"
+        hero_matches_board = bool(set(hero_ranks) & set(board_ranks))
+        if board_pairs >= 2 and not hero_matches_board:
+            pair_strength = "board_two_pair"
+        elif board_pairs >= 1 and hero_matches_board:
+            pair_strength = "paired_board_two_pair"
+        else:
+            pair_strength = "two_pair"
 
     all_suits = [card[1].lower() for card in used]
     hero_suits = {card[1].lower() for card in hero_cards}
@@ -491,6 +498,13 @@ def analyze_postflop(hero_cards: Sequence[str], board_cards: Sequence[str]) -> P
                 straight_draw_values.add(14 if missing_value == 1 else missing_value)
 
     plays_board = len(known_board) == 5 and _best_hand(known_board) == score
+    board_straight_values = set(board_ranks)
+    if 14 in board_straight_values:
+        board_straight_values.add(1)
+    board_straight_pressure = any(
+        len(set(range(low, low + 5)) & board_straight_values) >= 4
+        for low in range(1, 11)
+    )
     straight_outs = len(straight_draw_values) * 4
     flush_outs = 9 if flush_draw else 0
     overlap_outs = len(straight_draw_values) if flush_draw else 0
@@ -504,6 +518,7 @@ def analyze_postflop(hero_cards: Sequence[str], board_cards: Sequence[str]) -> P
         draw_outs=draw_outs,
         cards_to_come=5 - len(known_board),
         plays_board=plays_board,
+        board_straight_pressure=board_straight_pressure,
     )
 
 
