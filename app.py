@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import html
+import os
 import re
 import sqlite3
+import subprocess
 import threading
 import sys
 import traceback
@@ -77,6 +79,16 @@ BOARD_LABELS = {
     "turn": "Turn",
     "river": "River",
 }
+
+
+def _is_wslg_session() -> bool:
+    if sys.platform != "linux":
+        return False
+    try:
+        release = os.uname().release.lower()
+    except AttributeError:
+        release = ""
+    return "microsoft" in release and bool(os.environ.get("WSL_INTEROP"))
 
 
 @dataclass(frozen=True)
@@ -333,17 +345,33 @@ class PreflopApp(tk.Tk):
     def __init__(self, use_custom_chrome: bool = True) -> None:
         super().__init__()
         self._use_custom_chrome = use_custom_chrome
-        self._custom_chrome_backend = "override_redirect" if use_custom_chrome else "standard"
+        self._custom_chrome_backend = (
+            "managed_splash"
+            if use_custom_chrome and _is_wslg_session()
+            else "override_redirect"
+            if use_custom_chrome
+            else "standard"
+        )
         self._startup_window_checked = False
         self._custom_chrome_ready = False
-        self._custom_chrome_startup_attempts = 0
+        self._wslg_host_chrome_job: str | None = None
         self.title("Poker Hand Trainers by Cha0i")
         self._set_initial_geometry()
         self.minsize(760, 520)
         self.resizable(True, True)
         self.configure(bg=BG_MAIN, highlightthickness=0, bd=0)
         self.option_add("*HighlightThickness", 0)
-        self.withdraw()
+        # WSLg does not surface unmanaged override-redirect windows as Windows
+        # app windows.  A managed splash window keeps our own chrome visible
+        # while WSLg handles presentation, focus, and task switching normally.
+        if self._custom_chrome_backend == "managed_splash":
+            try:
+                self.wm_attributes("-type", "splash")
+                self._custom_chrome_ready = True
+            except tk.TclError:
+                self._custom_chrome_backend = "standard"
+        if self._custom_chrome_backend == "standard":
+            self.withdraw()
         self.fonts = {
             "title": tkfont.Font(family="Helvetica", size=BASE_FONT_SIZES["title"], weight="bold"),
             "subtitle": tkfont.Font(family="Helvetica", size=BASE_FONT_SIZES["subtitle"]),
@@ -491,6 +519,7 @@ class PreflopApp(tk.Tk):
         self._to_call_chips: int | None = None
         self._minimum_raise_chips: int | None = None
         self._big_blind_chips: int | None = None
+        self._preflop_bets_by_seat: dict[int, int] = {}
         self._strategy_players_count: int | None = None
         self._allin_pressure = False
         self._hero_acted_preflop = False
@@ -540,6 +569,8 @@ class PreflopApp(tk.Tk):
 
         if self._custom_chrome_backend == "override_redirect":
             self.bind("<Map>", self._restore_override_redirect)
+        elif self._custom_chrome_backend == "managed_splash":
+            self.bind("<Map>", self._schedule_wslg_host_chrome_removal)
         self.bind("<Configure>", self._schedule_layout_refresh)
         self._init_player_tracker_db()
         self._build_ui()
@@ -554,6 +585,7 @@ class PreflopApp(tk.Tk):
         self.after_idle(self._present_startup_window)
         self.after(120, self._ensure_window_visible)
         self.after(900, self._recover_invisible_startup_window)
+        self.after(300, self._schedule_wslg_host_chrome_removal)
 
     def _set_initial_geometry(self) -> None:
         screen_width = max(900, self.winfo_screenwidth())
@@ -601,6 +633,54 @@ class PreflopApp(tk.Tk):
         except tk.TclError:
             return
 
+    def _schedule_wslg_host_chrome_removal(self, _event: tk.Event | None = None) -> None:
+        if self._custom_chrome_backend != "managed_splash" or self._wslg_host_chrome_job is not None:
+            return
+        self._wslg_host_chrome_job = self.after(200, self._remove_wslg_host_chrome)
+
+    def _remove_wslg_host_chrome(self) -> None:
+        self._wslg_host_chrome_job = None
+        if self._custom_chrome_backend != "managed_splash" or not self.winfo_exists():
+            return
+
+        # WSLg exposes this X11 window to Windows through an msrdc host window.
+        # Removing the host's overlapped-window style preserves a visible,
+        # managed window while leaving this app's own title bar in control.
+        script = r'''
+$source = @"
+using System;
+using System.Runtime.InteropServices;
+public static class PokerOddsWindowStyle {
+  [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int index);
+  [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int index, int value);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
+}
+"@
+Add-Type -TypeDefinition $source
+$deadline = (Get-Date).AddSeconds(5)
+while ((Get-Date) -lt $deadline) {
+  $window = Get-Process | Where-Object {
+    $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -like "Poker Hand Trainers by Cha0i*"
+  } | Select-Object -First 1
+  if ($null -ne $window) {
+    $style = [PokerOddsWindowStyle]::GetWindowLong($window.MainWindowHandle, -16)
+    $borderlessStyle = $style -band (-bnot 0x00CF0000)
+    [PokerOddsWindowStyle]::SetWindowLong($window.MainWindowHandle, -16, $borderlessStyle) | Out-Null
+    [PokerOddsWindowStyle]::SetWindowPos($window.MainWindowHandle, [IntPtr]::Zero, 0, 0, 0, 0, 0x37) | Out-Null
+    break
+  }
+  Start-Sleep -Milliseconds 100
+}
+'''
+        try:
+            subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            return
+
     def _activate_custom_chrome_after_startup(self) -> None:
         if self._custom_chrome_backend != "override_redirect" or not self.winfo_exists():
             return
@@ -611,30 +691,15 @@ class PreflopApp(tk.Tk):
             self.update_idletasks()
             self.overrideredirect(True)
             self.geometry(geometry)
+            self._custom_chrome_ready = True
             self.deiconify()
             self.state("normal")
-            self._custom_chrome_ready = True
             self._clamp_window_to_screen()
             self.lift()
             self.attributes("-topmost", True)
             self.after(250, lambda: self.attributes("-topmost", False) if self.winfo_exists() else None)
             self.focus_force()
             self.update_idletasks()
-            if not (self.winfo_ismapped() and self.winfo_viewable()):
-                self._custom_chrome_startup_attempts += 1
-                if self._custom_chrome_startup_attempts <= 8:
-                    self.withdraw()
-                    self._custom_chrome_ready = False
-                    self.after(250, self._activate_custom_chrome_after_startup)
-                else:
-                    self.overrideredirect(False)
-                    self.deiconify()
-                    self.state("normal")
-                    self.lift()
-                    print(
-                        "Custom window chrome did not map cleanly; keeping the standard window visible.",
-                        flush=True,
-                    )
         except tk.TclError:
             return
 
@@ -645,18 +710,13 @@ class PreflopApp(tk.Tk):
         try:
             self._present_startup_window()
             if self.winfo_ismapped() and self.winfo_viewable():
-                if self._custom_chrome_backend == "override_redirect" and not self._custom_chrome_ready:
-                    self.after(100, self._activate_custom_chrome_after_startup)
                 return
-            if self._custom_chrome_backend == "override_redirect":
-                print(
-                    "Custom window chrome startup needed a remap; retrying borderless window presentation.",
-                    flush=True,
-                )
-                self.geometry("+80+80")
-                self.deiconify()
-                self.state("normal")
-                self._present_startup_window()
+            # A withdrawn root can survive into mainloop without an exception.
+            # Present it again at a known location, preserving the chosen chrome.
+            self.geometry("900x620+80+80")
+            self.deiconify()
+            self.state("normal")
+            self._present_startup_window()
         except tk.TclError:
             return
 
@@ -665,8 +725,9 @@ class PreflopApp(tk.Tk):
             return
         try:
             self._clamp_window_to_screen()
-            if self.state() == "iconic":
+            if self.state() in {"iconic", "withdrawn"}:
                 self.deiconify()
+                self.state("normal")
             self.lift()
             self.focus_force()
         except tk.TclError:
@@ -755,6 +816,7 @@ class PreflopApp(tk.Tk):
         self._to_call_chips = None
         self._minimum_raise_chips = None
         self._big_blind_chips = None
+        self._preflop_bets_by_seat = {}
         self._strategy_players_count = None
         self._allin_pressure = False
         self._hero_acted_preflop = False
@@ -1446,6 +1508,50 @@ class PreflopApp(tk.Tk):
             amount_int = int(amount) if isinstance(amount, int) else None
             self._record_action_event(player_id, "Post Blind", amount_int, "Preflop")
 
+    def _update_preflop_bet_snapshot(self, players: object) -> None:
+        """Retain partial Casino.org player snapshots until the next betting street."""
+        if not isinstance(players, list):
+            return
+
+        bets = self.__dict__.get("_preflop_bets_by_seat")
+        if not isinstance(bets, dict):
+            bets = {}
+            self._preflop_bets_by_seat = bets
+
+        for player in players:
+            if not isinstance(player, dict):
+                continue
+            seat_id = player.get("seatId")
+            bet = player.get("bet")
+            if isinstance(seat_id, int) and isinstance(bet, int) and bet >= 0:
+                bets[seat_id] = bet
+
+        self._refresh_preflop_price_from_bets()
+
+    def _refresh_preflop_price_from_bets(self) -> None:
+        bets = self.__dict__.get("_preflop_bets_by_seat")
+        hero_seat_id = self.__dict__.get("_hero_seat_id")
+        if not isinstance(bets, dict) or not bets or not isinstance(hero_seat_id, int):
+            return
+
+        hero_bet = bets.get(hero_seat_id)
+        if not isinstance(hero_bet, int):
+            return
+
+        highest_bet = max(bets.values(), default=0)
+        self._to_call_chips = max(0, highest_bet - hero_bet)
+        # Before the flop, the visible player contributions are the reliable pot
+        # source on Casino.org; tick messages themselves omit the player array.
+        self._pot_chips = sum(bets.values())
+
+    def _update_hero_turn_from_tick(self, update: dict[str, object]) -> None:
+        current_player = update.get("currentPlayer")
+        if not isinstance(current_player, dict):
+            return
+        seat_id = current_player.get("seatId")
+        if isinstance(seat_id, int) and isinstance(self._hero_seat_id, int):
+            self._hero_turn = seat_id == self._hero_seat_id
+
     def _hero_stood_up(self, update: dict[str, object]) -> bool:
         if not self._session_active or self._hero_user_id is None:
             return False
@@ -1861,6 +1967,7 @@ class PreflopApp(tk.Tk):
             "pot": self._pot_chips,
             "to_call": self._to_call_chips,
             "big_blind": getattr(self, "_big_blind_chips", None),
+            "preflop_bets": sorted(self.__dict__.get("_preflop_bets_by_seat", {}).items()),
             "hole": [card.code for card in self.selected],
             "board": [card.code for card in self.board_cards.values() if card is not None],
         }
@@ -2921,6 +3028,8 @@ class PreflopApp(tk.Tk):
             self._pot_chips = None
             self._to_call_chips = None
             self._minimum_raise_chips = None
+            self._big_blind_chips = None
+            self._preflop_bets_by_seat = {}
             self._recent_actions = []
             self._allin_pressure = False
             self._hero_acted_preflop = False
@@ -2999,11 +3108,16 @@ class PreflopApp(tk.Tk):
             )
 
         if action_lower == "blinds":
+            minimum_raise = update.get("minimumRaise")
+            if isinstance(minimum_raise, int) and minimum_raise > 0:
+                self._big_blind_chips = minimum_raise
             if isinstance(self._active_hand_record, dict):
-                minimum_raise = update.get("minimumRaise")
                 if isinstance(minimum_raise, int):
                     self._active_hand_record["blinds"] = minimum_raise
             self._record_blind_actions(update)
+
+        if action_lower == "tick":
+            self._update_hero_turn_from_tick(update)
 
         seats_snapshot = update.get("seats")
         if isinstance(seats_snapshot, list):
@@ -3027,7 +3141,9 @@ class PreflopApp(tk.Tk):
                 self._hero_sitting_out = self._player_is_sitting_out(seat)
                 break
 
-        if isinstance(players, list) and self._hero_seat_id is not None:
+        if self._street == "preflop":
+            self._update_preflop_bet_snapshot(players)
+        elif isinstance(players, list) and self._hero_seat_id is not None:
             hero = next((p for p in players if isinstance(p, dict) and p.get("seatId") == self._hero_seat_id), None)
             if isinstance(hero, dict):
                 hero_bet = int(hero.get("bet", 0)) if isinstance(hero.get("bet", 0), int) else 0
@@ -3041,6 +3157,9 @@ class PreflopApp(tk.Tk):
         if isinstance(chips, int) and chips >= 0 and action_lower in {"bet", "raise", "allin", "call", "updatepots"}:
             if action_lower == "updatepots":
                 self._pot_chips = chips
+            elif self._street == "preflop" and isinstance(players, list):
+                # The retained snapshot already contains this action's full bet.
+                pass
             else:
                 self._pot_chips = (self._pot_chips or 0) + chips
 
@@ -3139,6 +3258,7 @@ class PreflopApp(tk.Tk):
                 )
                 if self._street == "preflop":
                     self._hero_acted_preflop = True
+                self._hero_turn = False
                 if action_lower == "fold":
                     self._hero_folded_waiting_for_new_hole = True
 
@@ -3341,7 +3461,32 @@ class PreflopApp(tk.Tk):
         max_suit_count = max(suit_counts.values()) if suit_counts else 0
         flush_heavy_board = max_suit_count >= 3
         big_blind = self._big_blind_chips if isinstance(self._big_blind_chips, int) and self._big_blind_chips > 0 else None
-        facing_preflop_raise = bool(big_blind is not None and to_call > big_blind)
+        preflop_bets = self.__dict__.get("_preflop_bets_by_seat", {})
+        if not isinstance(preflop_bets, dict):
+            preflop_bets = {}
+        hero_seat_id = self.__dict__.get("_hero_seat_id")
+        hero_preflop_bet = preflop_bets.get(hero_seat_id) if isinstance(hero_seat_id, int) else None
+        highest_preflop_bet = max(preflop_bets.values(), default=0)
+        has_preflop_bet_snapshot = isinstance(hero_preflop_bet, int) and bool(preflop_bets)
+        preflop_unraised = bool(
+            self._street == "preflop"
+            and big_blind is not None
+            and has_preflop_bet_snapshot
+            and highest_preflop_bet <= big_blind
+        )
+        hero_has_free_big_blind_option = bool(
+            preflop_unraised and hero_preflop_bet is not None and hero_preflop_bet >= big_blind
+        )
+        opening_opportunity = bool(preflop_unraised and not hero_has_free_big_blind_option)
+        facing_preflop_raise = bool(
+            self._street == "preflop"
+            and big_blind is not None
+            and (
+                highest_preflop_bet > big_blind
+                if has_preflop_bet_snapshot
+                else to_call > big_blind
+            )
+        )
         preflop_allin_pressure = self._street == "preflop" and (
             self._allin_pressure
             or (big_blind is not None and to_call >= big_blind * 10)
@@ -3388,7 +3533,20 @@ class PreflopApp(tk.Tk):
                         headline = "STRONG HAND. RAISE."
                     details.append("The price is no more than one big blind, so treat this as unopened or limped action and raise for value.")
             elif preflop.tier == "Playable":
-                if facing_preflop_raise:
+                if opening_opportunity:
+                    if big_blind is not None:
+                        raise_target = max(big_blind * 3, self._minimum_raise_chips or 0)
+                        headline = f"PLAYABLE HAND. OPEN TO ABOUT {raise_target}."
+                        quick_math_text = f"TARGET ~{raise_target} | 3 BB"
+                    else:
+                        headline = "PLAYABLE HAND. OPEN SMALL."
+                    details.append(
+                        "The visible call is only the forced blind in an unopened pot, not a voluntary call against a raise."
+                    )
+                elif hero_has_free_big_blind_option:
+                    headline = "PLAYABLE HAND. CHECK FREE OPTION."
+                    details.append("You already posted the big blind and nobody raised. Take the free flop rather than inventing a call.")
+                elif facing_preflop_raise:
                     if pot_odds is not None and pot_odds <= 0.25:
                         headline = "PLAYABLE HAND. CALL SMALL."
                         details.append("The price is small enough to realize equity with a playable hand; avoid turning it into a big preflop pot.")
@@ -3406,7 +3564,10 @@ class PreflopApp(tk.Tk):
                     headline = "PLAYABLE HAND. OPEN SMALL."
                     details.append("Open small only when the action is unopened and your position permits it; this is not a premium hand.")
             elif preflop.tier == "Speculative":
-                if to_call > 0:
+                if opening_opportunity:
+                    headline = "SPECULATIVE HAND. FOLD."
+                    details.append("The displayed price is the forced blind in an unopened pot; do not turn this marginal hand into a limp.")
+                elif to_call > 0:
                     if pot_odds is not None and pot_odds <= 0.18 and players <= 3:
                         headline = "SPECULATIVE HAND. CALL ONLY IF CHEAP."
                         details.append("The price is tiny enough to see a flop, but this is still a low-commitment hand.")
@@ -3417,7 +3578,10 @@ class PreflopApp(tk.Tk):
                     headline = "SPECULATIVE HAND. CHECK FREE OPTION."
                     details.append("Take the free flop from the blind; without position information this is not an automatic open-raise.")
             else:
-                if to_call > 0:
+                if opening_opportunity:
+                    headline = "TRASH HAND. FOLD."
+                    details.append("The displayed price is the forced blind in an unopened pot, so folding costs nothing extra.")
+                elif to_call > 0:
                     headline = "TRASH HAND. FOLD."
                     details.append("Without a real steal spot, this is not worth paying to continue.")
                 else:
@@ -3648,6 +3812,8 @@ class PreflopApp(tk.Tk):
             self._pot_chips = None
             self._to_call_chips = None
             self._minimum_raise_chips = None
+            self._big_blind_chips = None
+            self._preflop_bets_by_seat = {}
             self._hero_turn = None
             self._strategy_players_count = None
             self._recent_actions = []
@@ -3789,6 +3955,12 @@ class PreflopApp(tk.Tk):
         self._update_strategy_panel()
 
     def destroy(self) -> None:
+        if self._wslg_host_chrome_job is not None:
+            try:
+                self.after_cancel(self._wslg_host_chrome_job)
+            except tk.TclError:
+                pass
+            self._wslg_host_chrome_job = None
         if self._hero_name_confirm_job is not None:
             try:
                 self.after_cancel(self._hero_name_confirm_job)
@@ -4795,10 +4967,12 @@ class PreflopApp(tk.Tk):
 def main() -> None:
     use_custom_chrome = "--standard-window" not in sys.argv
     print("Starting Poker Hand Trainer...", flush=True)
-    print(
-        "Using custom borderless window chrome." if use_custom_chrome else "Using standard OS window chrome.",
-        flush=True,
-    )
+    if not use_custom_chrome:
+        print("Using standard OS window chrome.", flush=True)
+    elif _is_wslg_session():
+        print("Using WSLg-compatible custom window chrome.", flush=True)
+    else:
+        print("Using custom borderless window chrome.", flush=True)
     try:
         app = PreflopApp(use_custom_chrome=use_custom_chrome)
         print("Poker Hand Trainer window initialized.", flush=True)

@@ -173,6 +173,8 @@ class TrackerTests(unittest.TestCase):
         app._to_call_chips = to_call
         app._minimum_raise_chips = None
         app._big_blind_chips = 4
+        app._hero_seat_id = None
+        app._preflop_bets_by_seat = {}
         app._allin_pressure = False
         app._hero_acted_preflop = False
         app._recent_actions = []
@@ -872,6 +874,71 @@ class TrackerTests(unittest.TestCase):
         )
 
         self.assertEqual(recommendation, "check")
+
+    def test_preflop_blind_snapshot_keeps_price_for_playerless_tick(self) -> None:
+        app = object.__new__(PreflopApp)
+        app._hero_seat_id = 3
+        app._preflop_bets_by_seat = {0: 0, 1: 0, 3: 0, 5: 0}
+        app._pot_chips = None
+        app._to_call_chips = None
+
+        PreflopApp._update_preflop_bet_snapshot(
+            app,
+            [
+                {"seatId": 0, "bet": 1},
+                {"seatId": 1, "bet": 2},
+            ],
+        )
+
+        self.assertEqual(app._to_call_chips, 2)
+        self.assertEqual(app._pot_chips, 3)
+
+    def test_tick_identifies_when_action_reaches_hero(self) -> None:
+        app = object.__new__(PreflopApp)
+        app._hero_seat_id = 3
+        app._hero_turn = None
+
+        PreflopApp._update_hero_turn_from_tick(app, {"currentPlayer": {"seatId": 0}})
+        self.assertFalse(app._hero_turn)
+        PreflopApp._update_hero_turn_from_tick(app, {"currentPlayer": {"seatId": 3}})
+        self.assertTrue(app._hero_turn)
+
+    def test_unposted_preflop_hand_never_gets_a_free_check(self) -> None:
+        app = self._strategy_app([Card("5", "s"), Card("2", "c")], to_call=2, pot=3, players=4)
+        app._big_blind_chips = 2
+        app._hero_seat_id = 3
+        app._preflop_bets_by_seat = {0: 1, 1: 2, 3: 0, 5: 0}
+
+        PreflopApp._update_strategy_panel(app)
+
+        app.strategy_quick_var.set.assert_called_with("FOLD")
+        advice = app.strategy_advice_var.set.call_args.args[0]
+        self.assertTrue(advice.startswith("TRASH HAND. FOLD."))
+        self.assertNotIn("CHECK FREE", advice)
+
+    def test_small_blind_playable_hand_opens_in_unraised_pot(self) -> None:
+        app = self._strategy_app([Card("A", "s"), Card("7", "s")], to_call=1, pot=3, players=4)
+        app._big_blind_chips = 2
+        app._minimum_raise_chips = 2
+        app._hero_seat_id = 3
+        app._preflop_bets_by_seat = {3: 1, 4: 2}
+
+        PreflopApp._update_strategy_panel(app)
+
+        app.strategy_quick_var.set.assert_called_with("RAISE")
+        advice = app.strategy_advice_var.set.call_args.args[0]
+        self.assertTrue(advice.startswith("PLAYABLE HAND. OPEN TO ABOUT 6."))
+
+    def test_big_blind_min_raise_counts_as_real_pressure(self) -> None:
+        app = self._strategy_app([Card("A", "s"), Card("T", "h")], to_call=2, pot=6, players=3)
+        app._big_blind_chips = 2
+        app._hero_seat_id = 3
+        app._preflop_bets_by_seat = {0: 4, 3: 2}
+
+        PreflopApp._update_strategy_panel(app)
+
+        advice = app.strategy_advice_var.set.call_args.args[0]
+        self.assertTrue(advice.startswith("STRONG HAND. CALL OR 3-BET CAREFULLY."))
 
     def test_playable_preflop_hand_continues_against_one_blind(self) -> None:
         app = self._strategy_app([Card("8", "d"), Card("8", "c")], to_call=2, pot=10, players=3)
