@@ -65,7 +65,10 @@ source = source.replace(
     '        payloadWithBridgeContext: payloadWithBridgeContext,\n' +
     '        payloadFromArgs: payloadFromArgs,\n' +
     '        payloadsFromArgs: payloadsFromArgs,\n' +
-    '        strategyEventsFromArgs: strategyEventsFromArgs\n' +
+    '        strategyEventsFromArgs: strategyEventsFromArgs,\n' +
+    '        currentSiteKey: currentSiteKey,\n' +
+    '        isDiscoveryHost: isDiscoveryHost,\n' +
+    '        isUnibetLauncherPage: isUnibetLauncherPage\n' +
     '    };\n\n' +
     '    // Public helper for console/manual automation.'
 );
@@ -78,6 +81,9 @@ const withBridgeContext = context.__relaxParserTestApi.payloadWithBridgeContext;
 const payloadFromArgs = context.__relaxParserTestApi.payloadFromArgs;
 const payloadsFromArgs = context.__relaxParserTestApi.payloadsFromArgs;
 const strategyEventsFromArgs = context.__relaxParserTestApi.strategyEventsFromArgs;
+const currentSiteKey = context.__relaxParserTestApi.currentSiteKey;
+const isDiscoveryHost = context.__relaxParserTestApi.isDiscoveryHost;
+const isUnibetLauncherPage = context.__relaxParserTestApi.isUnibetLauncherPage;
 const tableWithNames = (names, states, board = null, bets = [0, 0, 0, 0, 0, 0], pots = []) => [
     names,
     states,
@@ -102,8 +108,29 @@ assert.equal(
 assert.deepEqual(JSON.parse(JSON.stringify(withBridgeContext({ type: 'poker_cards' }))), {
     type: 'poker_cards',
     site: 'unknown',
-    bridgeVersion: '2.8'
+    bridgeVersion: '2.9'
 });
+
+windowValue.location.hostname = 'www.unibet.nl';
+windowValue.location.pathname = '/play/pokerwebclient';
+assert.equal(currentSiteKey(), 'unibet_nl_pokerwebclient');
+assert.equal(isUnibetLauncherPage(), true);
+assert.equal(isDiscoveryHost(), false);
+
+windowValue.location.hostname = 'poker.relaxg.com';
+windowValue.location.pathname = '/prefix/kenobi/clients/unibet/table';
+assert.equal(currentSiteKey(), 'unibet_nl_pokerwebclient');
+assert.equal(isDiscoveryHost(), true);
+
+windowValue.location.hostname = 'poker.relaxgaming.com';
+windowValue.location.pathname = '/kenobi/clients/unibet/table';
+assert.equal(currentSiteKey(), 'unibet_nl_pokerwebclient');
+assert.equal(isDiscoveryHost(), true);
+
+windowValue.location.hostname = 'poker.relaxg.com';
+windowValue.location.pathname = '/kenobi/clients/other/table';
+assert.equal(currentSiteKey(), 'unknown');
+assert.equal(isDiscoveryHost(), false);
 
 assert.equal(strategyEventsFromArgs([{ updates: [{ action: 'fold' }] }]).length, 0);
 assert.equal(strategyEventsFromArgs([{ action: 'ping' }]).length, 0);

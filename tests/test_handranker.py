@@ -1,6 +1,6 @@
 import unittest
 
-from handranker import analyze_postflop, describe_current_hand, evaluate_preflop
+from handranker import analyze_postflop, describe_current_hand, evaluate_preflop, simulate_equity
 
 
 class HandRankerTests(unittest.TestCase):
@@ -62,6 +62,18 @@ class HandRankerTests(unittest.TestCase):
         profile = analyze_postflop(["Qh", "9s"], ["2c", "Qs", "Ks", "Jc", "9c"])
 
         self.assertTrue(profile.board_straight_pressure)
+
+    def test_complete_heads_up_board_uses_exact_equity(self) -> None:
+        win, tie, loss = simulate_equity(
+            ["Jd", "3d"],
+            ["9d", "Qd", "3s", "9h", "4h"],
+            player_count=2,
+            simulations=1,
+        )
+
+        self.assertAlmostEqual(win, 550 / 990)
+        self.assertAlmostEqual(tie, 54 / 990)
+        self.assertAlmostEqual(loss, 386 / 990)
 
 
 if __name__ == "__main__":

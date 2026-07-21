@@ -547,6 +547,22 @@ def simulate_equity(
     if cards_needed > len(remaining):
         raise ValueError("Not enough cards remaining for the requested simulation.")
 
+    if unknown_board == 0 and opponents == 1:
+        hero_score = _best_hand([*hero_cards, *known_board])
+        wins = 0
+        ties = 0
+        losses = 0
+        for villain_hand in itertools.combinations(remaining, 2):
+            villain_score = _best_hand([*villain_hand, *known_board])
+            if hero_score > villain_score:
+                wins += 1
+            elif hero_score == villain_score:
+                ties += 1
+            else:
+                losses += 1
+        total = wins + ties + losses
+        return wins / total, ties / total, losses / total
+
     wins = 0.0
     ties = 0.0
 

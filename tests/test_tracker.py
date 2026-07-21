@@ -189,7 +189,7 @@ class TrackerTests(unittest.TestCase):
         app.strategy_quick_sub_var = Mock()
         app.strategy_advice_var = Mock()
         app.equity_var = Mock()
-        app.equity_var.get.return_value = "Total equity: -"
+        app.equity_var.get.return_value = "Equity: -"
         app.strategy_quick_label = None
         app.strategy_quick_sub_label = None
         app._capture_advice_snapshot = Mock()
@@ -667,7 +667,7 @@ class TrackerTests(unittest.TestCase):
 
         PreflopApp._run_odds_update(app, players=3, board_codes=["9s", "2d", "9h"])
 
-        app.equity_var.set.assert_called_once_with("Total equity: 45.0%")
+        app.equity_var.set.assert_called_once_with("Equity: 45.0%")
         app._update_strategy_panel.assert_called_once_with()
 
     def test_random_equity_does_not_turn_ace_high_into_a_call(self) -> None:
@@ -752,7 +752,7 @@ class TrackerTests(unittest.TestCase):
 
         self.assertEqual(headline, "TWO PAIR ON FOUR-LINER. BET 33% POT OR CHECK.")
 
-    def test_strategy_panel_shows_exact_paired_board_bet_size(self) -> None:
+    def test_strategy_panel_checks_paired_board_two_pair(self) -> None:
         app = self._strategy_app([Card("A", "h"), Card("5", "h")], to_call=0, pot=7, players=2)
         app._street = "turn"
         app.board_cards.update(
@@ -763,15 +763,20 @@ class TrackerTests(unittest.TestCase):
                 "turn": Card("A", "c"),
             }
         )
-        app.equity_var.get.return_value = "Total equity: 83.0%"
+        app.equity_var.get.return_value = "Equity: 83.0%"
 
         PreflopApp._update_strategy_panel(app)
 
-        app.strategy_quick_var.set.assert_called_with("BET")
-        app.strategy_quick_sub_var.set.assert_called_with("SIZE ~2 | 33% POT")
+        app.strategy_quick_var.set.assert_called_with("CHECK")
         advice = app.strategy_advice_var.set.call_args.args[0]
-        self.assertTrue(advice.startswith("PAIRED-BOARD TWO PAIR. BET 33% POT."))
-        self.assertIn("Target about 2 chips", advice)
+        self.assertTrue(advice.startswith("PAIRED-BOARD TWO PAIR. CHECK."))
+
+    def test_jack_three_on_paired_nines_checks_for_showdown(self) -> None:
+        profile = analyze_postflop(["Jd", "3d"], ["9d", "Qd", "3s", "9h", "4h"])
+
+        headline, _reason = _recommend_when_checked_to(profile, "river")
+
+        self.assertEqual(headline, "PAIRED-BOARD TWO PAIR. CHECK.")
 
     def test_unibet_outgoing_action_is_written_to_training_log(self) -> None:
         app = object.__new__(PreflopApp)
@@ -902,6 +907,16 @@ class TrackerTests(unittest.TestCase):
         self.assertFalse(app._hero_turn)
         PreflopApp._update_hero_turn_from_tick(app, {"currentPlayer": {"seatId": 3}})
         self.assertTrue(app._hero_turn)
+
+    def test_preflop_without_blind_state_waits_instead_of_checking(self) -> None:
+        app = self._strategy_app([Card("5", "s"), Card("2", "c")], to_call=0, pot=None, players=4)
+        app._big_blind_chips = None
+
+        PreflopApp._update_strategy_panel(app)
+
+        app.strategy_quick_var.set.assert_called_with("WAIT")
+        advice = app.strategy_advice_var.set.call_args.args[0]
+        self.assertTrue(advice.startswith("WAIT FOR PREFLOP STATE."))
 
     def test_unposted_preflop_hand_never_gets_a_free_check(self) -> None:
         app = self._strategy_app([Card("5", "s"), Card("2", "c")], to_call=2, pot=3, players=4)

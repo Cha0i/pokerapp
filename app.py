@@ -190,9 +190,9 @@ def _recommend_facing_postflop_bet(
 def _recommended_bet_fraction(profile: PostflopProfile, street: str) -> float | None:
     if profile.category in {"straight_flush", "four_kind", "full_house", "flush", "straight", "three_kind"}:
         return 0.60
-    if profile.category == "two_pair" and (
-        profile.pair_strength == "paired_board_two_pair" or profile.board_straight_pressure
-    ):
+    if profile.category == "two_pair" and profile.pair_strength == "paired_board_two_pair":
+        return None
+    if profile.category == "two_pair" and profile.board_straight_pressure:
         return 0.33
     if profile.category == "two_pair" and profile.pair_strength != "board_two_pair":
         return 0.50
@@ -210,8 +210,8 @@ def _recommend_when_checked_to(profile: PostflopProfile, street: str = "flop") -
         return "STRONG MADE HAND. BET 60% POT FOR VALUE.", "This hand is strong enough to build the pot without relying on raw equity alone."
     if profile.category == "two_pair" and profile.pair_strength == "paired_board_two_pair":
         return (
-            "PAIRED-BOARD TWO PAIR. BET 33% POT.",
-            "Take thin value at a controlled size; this is not a stack-off hand because the board-pair rank makes trips.",
+            "PAIRED-BOARD TWO PAIR. CHECK.",
+            "Your hole-card pair improves the board, but trips, a higher kicker pair, and full houses dominate the hands that continue.",
         )
     if profile.category == "two_pair" and profile.board_straight_pressure:
         return (
@@ -275,7 +275,7 @@ BRIDGE_ALLOWED_ORIGINS = {
     for site in SUPPORTED_BRIDGE_SITES
     for origin in site.allowed_origins
 }
-BRIDGE_USERSCRIPT_VERSION = "2.8"
+BRIDGE_USERSCRIPT_VERSION = "2.9"
 BRIDGE_POLL_BATCH_SIZE = 32
 BRIDGE_POLL_IDLE_MS = 120
 BRIDGE_POLL_BACKLOG_MS = 1
@@ -405,7 +405,7 @@ class PreflopApp(tk.Tk):
         self.win_var = tk.StringVar(value="Win: -")
         self.tie_var = tk.StringVar(value="Tie: -")
         self.loss_var = tk.StringVar(value="Loss: -")
-        self.equity_var = tk.StringVar(value="Total equity: -")
+        self.equity_var = tk.StringVar(value="Equity: -")
         self.odds_note_var = tk.StringVar(value="Select two hole cards to unlock board selection.")
         self.hand_rank_status_var = tk.StringVar(value="Hand odds: select 2 hole cards")
         self.hand_rank_you_vars = {key: tk.StringVar(value="-") for key, _label in HAND_CATEGORY_ORDER}
@@ -582,6 +582,8 @@ class PreflopApp(tk.Tk):
         if not self._bridge_available:
             self.server_status_var.set("Bridge: unavailable (install Flask and Werkzeug)")
             self.server_info_var.set("Core app will run without the browser bridge.")
+        else:
+            self.after_idle(self._start_server)
         self.after_idle(self._present_startup_window)
         self.after(120, self._ensure_window_visible)
         self.after(900, self._recover_invisible_startup_window)
@@ -3169,6 +3171,15 @@ while ((Get-Date) -lt $deadline) {
         minimum_raise = update.get("minimumRaise")
         if isinstance(minimum_raise, int) and minimum_raise >= 0:
             self._minimum_raise_chips = minimum_raise
+            if (
+                action_lower == "tick"
+                and self._street == "preflop"
+                and self._big_blind_chips is None
+                and minimum_raise > 0
+            ):
+                # Casino.org's first preflop tick carries the blind size even if
+                # an earlier partial blind snapshot reached the bridge late.
+                self._big_blind_chips = minimum_raise
             if self._to_call_chips is None:
                 self._to_call_chips = minimum_raise
 
@@ -3498,7 +3509,10 @@ while ((Get-Date) -lt $deadline) {
         quick_math_text: str | None = None
 
         if self._street == "preflop":
-            if self._hero_acted_preflop and to_call == 0:
+            if big_blind is None:
+                headline = "WAIT FOR PREFLOP STATE."
+                details.append("Blind and call-price data have not arrived yet, so do not treat this as a free check.")
+            elif self._hero_acted_preflop and to_call == 0:
                 headline = "PRE-FLOP DECISION MADE. WAIT FOR FLOP."
                 details.append("You already acted preflop and there is no new price to call. Let the flop arrive before changing plans.")
             elif preflop_allin_pressure and to_call > 0:
@@ -4793,11 +4807,11 @@ while ((Get-Date) -lt $deadline) {
             self.after_cancel(self.odds_after_id)
             self.odds_after_id = None
 
-        self.odds_status_var.set(f"Odds vs {players - 1} opponents (calculating...)")
+        self.odds_status_var.set(f"Odds vs {players - 1} random opponents (calculating...)")
         self.win_var.set("Win: ...")
         self.tie_var.set("Tie: ...")
         self.loss_var.set("Loss: ...")
-        self.equity_var.set("Total equity: ...")
+        self.equity_var.set("Equity: ...")
 
         self.odds_after_id = self.after(120, lambda: self._run_odds_update(players, board_codes))
 
@@ -4864,7 +4878,7 @@ while ((Get-Date) -lt $deadline) {
                 self.win_var.set("Win: -")
                 self.tie_var.set("Tie: -")
                 self.loss_var.set("Loss: -")
-                self.equity_var.set("Total equity: -")
+                self.equity_var.set("Equity: -")
                 if self.equity_label is not None:
                     self.equity_label.configure(fg=FG_MAIN)
                 self._update_strategy_panel()
@@ -4872,11 +4886,11 @@ while ((Get-Date) -lt $deadline) {
             self.odds_cache[key] = (win, tie, loss)
 
         equity = win + tie
-        self.odds_status_var.set(f"Odds vs {players - 1} opponents")
+        self.odds_status_var.set(f"Odds vs {players - 1} random opponents")
         self.win_var.set(f"Win: {win * 100:.1f}%")
         self.tie_var.set(f"Tie: {tie * 100:.1f}%")
         self.loss_var.set(f"Loss: {loss * 100:.1f}%")
-        self.equity_var.set(f"Total equity: {equity * 100:.1f}%")
+        self.equity_var.set(f"Equity: {equity * 100:.1f}%")
         if self.equity_label is not None:
             self.equity_label.configure(fg=self._score_color(int(equity * 100)))
         self._update_strategy_panel()
@@ -4915,7 +4929,7 @@ while ((Get-Date) -lt $deadline) {
             self.win_var.set("Win: -")
             self.tie_var.set("Tie: -")
             self.loss_var.set("Loss: -")
-            self.equity_var.set("Total equity: -")
+            self.equity_var.set("Equity: -")
             self.hand_rank_status_var.set("Hand odds: select 2 hole cards")
             for key, _label in HAND_CATEGORY_ORDER:
                 self.hand_rank_you_vars[key].set("-")

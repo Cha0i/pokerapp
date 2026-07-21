@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokerOdds Tagged Bridge
 // @namespace    http://tampermonkey.net/
-// @version      2.8
+// @version      2.9
 // @description  Forward poker console messages to local PokerOdds bridge
 // @downloadURL  http://127.0.0.1:5000/tampermonkey-bridge.user.js
 // @updateURL    http://127.0.0.1:5000/tampermonkey-bridge.user.js
@@ -9,7 +9,10 @@
 // @match        *://*.casino.org/*
 // @match        *://unibet.nl/*
 // @match        *://*.unibet.nl/*
-// @match        *://*.relaxg.com/kenobi/clients/unibet/*
+// @match        *://relaxg.com/*
+// @match        *://*.relaxg.com/*
+// @match        *://relaxgaming.com/*
+// @match        *://*.relaxgaming.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
@@ -21,7 +24,7 @@
 (function () {
     'use strict';
 
-    var SCRIPT_VERSION = '2.8';
+    var SCRIPT_VERSION = '2.9';
     var BRIDGE_URLS = ['http://127.0.0.1:5000/log', 'http://localhost:5000/log'];
     var currentBridgeUrlIndex = 0;
     var BRIDGE_TAG = 'TM_BRIDGE:';
@@ -62,21 +65,28 @@
         localDiagnostic(state === 'connected' ? 'info' : 'warn', detail);
     }
 
+    function isHostOrSubdomain(host, domain) {
+        return host === domain || host.slice(-(domain.length + 1)) === '.' + domain;
+    }
+
+    function isUnibetRelaxClientPage() {
+        var host = window.location && window.location.hostname ? window.location.hostname.toLowerCase() : '';
+        var path = window.location && window.location.pathname ? window.location.pathname.toLowerCase() : '';
+        return (
+            (isHostOrSubdomain(host, 'relaxg.com') || isHostOrSubdomain(host, 'relaxgaming.com')) &&
+            path.indexOf('/kenobi/clients/unibet/') !== -1
+        );
+    }
+
     function currentSiteKey() {
         var host = window.location && window.location.hostname ? window.location.hostname.toLowerCase() : '';
-        if (host === 'unibet.nl' || host === 'www.unibet.nl') {
+        if (isHostOrSubdomain(host, 'unibet.nl')) {
             return 'unibet_nl_pokerwebclient';
         }
-        if (host.slice(-10) === '.unibet.nl') {
+        if (isUnibetRelaxClientPage()) {
             return 'unibet_nl_pokerwebclient';
         }
-        if (
-            (host === 'relaxg.com' || host.slice(-11) === '.relaxg.com') &&
-            window.location.pathname.toLowerCase().indexOf('/kenobi/clients/unibet/') === 0
-        ) {
-            return 'unibet_nl_pokerwebclient';
-        }
-        if (host === 'casino.org' || host.slice(-11) === '.casino.org') {
+        if (isHostOrSubdomain(host, 'casino.org')) {
             return 'casino_org_replaypoker';
         }
         return 'unknown';
@@ -86,19 +96,14 @@
         if (currentSiteKey() !== 'unibet_nl_pokerwebclient') {
             return false;
         }
-        var host = window.location && window.location.hostname ? window.location.hostname.toLowerCase() : '';
-        var path = window.location && window.location.pathname ? window.location.pathname.toLowerCase() : '';
-        return (
-            (host === 'relaxg.com' || host.slice(-11) === '.relaxg.com') &&
-            path.indexOf('/kenobi/clients/unibet/') === 0
-        );
+        return isUnibetRelaxClientPage();
     }
 
     function isUnibetLauncherPage() {
         var host = window.location && window.location.hostname ? window.location.hostname.toLowerCase() : '';
         var path = window.location && window.location.pathname ? window.location.pathname.toLowerCase() : '';
         return (
-            (host === 'unibet.nl' || host === 'www.unibet.nl' || host.slice(-10) === '.unibet.nl') &&
+            isHostOrSubdomain(host, 'unibet.nl') &&
             path.indexOf('/play/pokerwebclient') === 0
         );
     }
