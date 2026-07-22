@@ -10,7 +10,7 @@ import re
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import mean, median, stdev
 from typing import Any, Iterable
@@ -230,11 +230,109 @@ def load_hands(path: Path, hero_name: str) -> dict[int, Hand]:
     return hands
 
 
+def street_from_board(board: tuple[str, ...]) -> str:
+    if not board:
+        return "preflop"
+    if len(board) == 3:
+        return "flop"
+    if len(board) == 4:
+        return "turn"
+    if len(board) == 5:
+        return "river"
+    return "unknown"
+
+
+def load_normalized_hands(path: Path) -> dict[int, Hand]:
+    """Infer hero decisions from current TM_BRIDGE state snapshots.
+
+    Newer Unibet bridge logs keep raw transport mirroring off during play and
+    record compact state snapshots instead of raw WS_SEND action frames. This
+    fallback reconstructs the important audit surface from hero-turn windows.
+    """
+
+    rows_by_hand: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for event in read_json_lines(path):
+        if event.get("event") != "process_console_line_accept":
+            continue
+        payload = event.get("payload")
+        ts = parse_timestamp(event.get("ts"))
+        if ts is None or not isinstance(payload, dict) or payload.get("type") != "poker_cards":
+            continue
+        hand_id = payload.get("handId")
+        if not isinstance(hand_id, int):
+            continue
+        row = dict(payload)
+        row["_ts"] = ts
+        rows_by_hand[hand_id].append(row)
+
+    hands: dict[int, Hand] = {}
+    for hand_id, rows in rows_by_hand.items():
+        hand = hands.setdefault(hand_id, Hand(hand_id))
+        last_pot: int | None = None
+        last_to_call: int | None = None
+        hole: tuple[str, ...] = ()
+        board: tuple[str, ...] = ()
+        for index, payload in enumerate(rows):
+            payload_hole = payload.get("hole")
+            if isinstance(payload_hole, list) and len(payload_hole) == 2:
+                hole = tuple(str(card) for card in payload_hole if isinstance(card, str))
+                hand.hole = hole
+            payload_board = payload.get("board")
+            if isinstance(payload_board, list):
+                board = tuple(str(card) for card in payload_board if isinstance(card, str))
+                hand.board = board
+            if isinstance(payload.get("pot"), int):
+                last_pot = payload["pot"]
+            if isinstance(payload.get("toCall"), int):
+                last_to_call = payload["toCall"]
+            if payload.get("heroTurn") is not True or not hole:
+                continue
+
+            action = "unknown"
+            cost = 0
+            next_pot: int | None = None
+            next_to_call: int | None = None
+            for next_payload in rows[index + 1 : index + 9]:
+                if next_payload.get("heroTurn") is True:
+                    break
+                if next_payload.get("heroFolded") is True:
+                    action = "fold"
+                    break
+                if isinstance(next_payload.get("pot"), int):
+                    next_pot = next_payload["pot"]
+                if isinstance(next_payload.get("toCall"), int):
+                    next_to_call = next_payload["toCall"]
+                if next_payload.get("heroTurn") is False and ("pot" in next_payload or "toCall" in next_payload):
+                    if next_to_call == 0:
+                        break
+                    if (last_to_call or 0) == 0 and next_pot is not None:
+                        break
+
+            price = last_to_call if isinstance(last_to_call, int) else 0
+            if action != "fold":
+                if price > 0:
+                    if next_to_call == 0 or (
+                        next_pot is not None and last_pot is not None and next_pot >= last_pot + price
+                    ):
+                        action = "call"
+                        cost = price
+                elif next_pot is not None and last_pot is not None and next_pot > last_pot:
+                    action = "bet"
+                    cost = next_pot - last_pot
+                else:
+                    action = "check"
+                    cost = 0
+            hand.decisions.append(Decision(payload["_ts"], hand_id, action, cost))
+        hand.decisions.sort(key=lambda item: item.ts)
+    return hands
+
+
 def match_advice(hands: dict[int, Hand], advice_by_hand: dict[int, list[Advice]]) -> None:
     for hand_id, hand in hands.items():
         advice = advice_by_hand.get(hand_id, [])
         for decision in hand.decisions:
-            available = [item for item in advice if not item.used and item.ts <= decision.ts]
+            cutoff = decision.ts + timedelta(seconds=2)
+            available = [item for item in advice if not item.used and item.ts <= cutoff]
             if not available:
                 continue
             decision.advice = available[-1]
@@ -288,6 +386,9 @@ def summarize(hands: dict[int, Hand], advice_by_hand: dict[int, list[Advice]]) -
     call_over_folds = [decision for decision in ignored_folds if decision.action == "call"]
     ignored_fold_hands = {decision.hand_id for decision in ignored_folds}
     ignored_complete = [hand for hand in complete if hand.hand_id in ignored_fold_hands]
+    ignored_for_listing = ignored_complete or [
+        hand for hand in strategy_hands if hand.hand_id in ignored_fold_hands
+    ]
     strict_complete = [hand for hand in complete if hand.hand_id not in ignored_fold_hands]
 
     preflop_decisions = [decision for decision in decisions if decision.advice and decision.advice.street == "preflop"]
@@ -407,7 +508,7 @@ def summarize(hands: dict[int, Hand], advice_by_hand: dict[int, list[Advice]]) -
             f"rough 95% interval {low:+.1f} to {high:+.1f} (not enough evidence of positive EV)",
         )
 
-    for hand in sorted(ignored_complete, key=lambda item: item.delta or 0, reverse=True):
+    for hand in sorted(ignored_for_listing, key=lambda item: item.delta or 0, reverse=True):
         disagreements = [decision for decision in hand.decisions if decision in ignored_folds]
         descriptions = []
         for decision in disagreements:
@@ -526,6 +627,10 @@ def main() -> int:
     advice = load_advice(args.strategy_log)
     hands = load_hands(args.app_log, args.hero)
     match_advice(hands, advice)
+    if not any(hand.decisions for hand in hands.values()):
+        advice = load_advice(args.strategy_log)
+        hands = load_normalized_hands(args.app_log)
+        match_advice(hands, advice)
     print(summarize(hands, advice))
     if args.replay_current:
         print()

@@ -130,9 +130,29 @@ def _recommend_facing_postflop_bet(
 ) -> tuple[str, str, float]:
     target = _range_adjusted_equity_target(pot_odds, players)
     has_target_equity = equity is not None and equity >= target
+    stack_pressure = pot_odds >= 0.40
+    heavy_pressure = pot_odds >= 0.33
 
     if profile.plays_board:
         return "BOARD PLAYS. FOLD TO PRESSURE.", "The board supplies the made hand, so a bettor can still hold cards that improve on it.", target
+    if profile.category == "one_pair" and profile.pair_strength == "board_pair":
+        return "BOARD PAIR ONLY. FOLD.", "The pair belongs to the board; your hole cards have not made a pair.", target
+    if stack_pressure and (
+        (profile.category == "one_pair" and profile.pair_strength in {"top_pair", "overpair", "lower_pair", "underpair"})
+        or (profile.category == "two_pair" and profile.pair_strength not in {"board_two_pair", "paired_board_two_pair"})
+    ):
+        if profile.category == "two_pair":
+            return (
+                "TWO PAIR. FOLD TO STACK PRESSURE.",
+                "Two pair is not a stack-off hand by default when an unknown betting range asks for this much of the pot.",
+                target,
+            )
+        return (
+            "ONE PAIR. FOLD TO STACK PRESSURE.",
+            "Random-hand equity is too optimistic here; one pair needs a specific read before calling massive pressure.",
+            target,
+        )
+
     if profile.category in {"straight_flush", "four_kind", "full_house", "flush", "straight", "three_kind"}:
         if has_target_equity or profile.category in {"straight_flush", "four_kind", "full_house"}:
             return "STRONG MADE HAND. RAISE FOR VALUE.", "Your actual made hand supports continuing aggressively.", target
@@ -162,10 +182,18 @@ def _recommend_facing_postflop_bet(
             target,
         )
     if profile.category == "two_pair" and profile.pair_strength != "board_two_pair":
+        if heavy_pressure and not has_target_equity:
+            return "TWO PAIR UNDER PRESSURE. FOLD.", "The price is high enough that two pair needs clean range evidence, not just showdown value.", target
         if has_target_equity:
             return "TWO PAIR. CALL OR RAISE CAREFULLY.", "Two pair has real showdown strength, though coordinated boards can still contain stronger value.", target
         return "TWO PAIR UNDER PRESSURE. CALL CAUTIOUSLY.", "The made hand is real, but the price is demanding enough to avoid a large raise.", target
     if profile.category == "one_pair" and profile.pair_strength in {"top_pair", "overpair"}:
+        if heavy_pressure and profile.flush_draw:
+            return (
+                "ONE PAIR PLUS DRAW. FOLD TO HEAVY PRESSURE.",
+                "The draw helps, but a made one-pair hand plus outs is still too thin against a large betting range.",
+                target,
+            )
         if has_target_equity:
             return "ONE-PAIR HAND. CALL CAUTIOUSLY.", "Top pair or an overpair can continue at this price, but it is not automatically a raising hand.", target
         return "ONE PAIR, BAD PRICE. FOLD.", "A betting range is stronger than a random hand, and this price needs more than one-pair optimism.", target
@@ -183,8 +211,6 @@ def _recommend_facing_postflop_bet(
         if pot_odds <= draw_price_limit:
             return "GUTSHOT. CALL SMALL ONLY.", "A very small price can justify chasing the four-out draw.", target
         return "GUTSHOT OR OVERCARDS. FOLD.", "Random-hand equity overstates this weak draw against a player who chose to bet.", target
-    if profile.category == "one_pair" and profile.pair_strength == "board_pair":
-        return "BOARD PAIR ONLY. FOLD.", "The pair belongs to the board; your hole cards have not made a pair.", target
     return "WEAK HAND VS BET. FOLD.", "High-card equity against random cards is not enough evidence to call an actual betting range.", target
 
 
@@ -3644,10 +3670,17 @@ while ((Get-Date) -lt $deadline) {
                     details.append("Open small only when the action is unopened and your position permits it; this is not a premium hand.")
             elif preflop.tier == "Speculative":
                 if opening_opportunity:
-                    headline = "SPECULATIVE HAND. FOLD."
-                    details.append("The displayed price is the forced blind in an unopened pot; do not turn this marginal hand into a limp.")
+                    if preflop.score >= 55:
+                        headline = "SPECULATIVE HAND. CALL TO SEE FLOP."
+                        details.append("No one has raised and the price is only blind-level, so this score is good enough to see a low-commitment flop.")
+                    else:
+                        headline = "SPECULATIVE HAND. FOLD."
+                        details.append("The displayed price is the forced blind in an unopened pot; do not turn this marginal hand into a limp.")
                 elif to_call > 0:
-                    if pot_odds is not None and pot_odds <= 0.18 and players <= 3:
+                    if not facing_preflop_raise and preflop.score >= 55:
+                        headline = "SPECULATIVE HAND. CALL TO SEE FLOP."
+                        details.append("No one has raised and the price is no more than the blind, so take the cheap flop with this speculative score.")
+                    elif pot_odds is not None and pot_odds <= 0.18 and players <= 3:
                         headline = "SPECULATIVE HAND. CALL ONLY IF CHEAP."
                         details.append("The price is tiny enough to see a flop, but this is still a low-commitment hand.")
                     else:

@@ -99,6 +99,30 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(args[:2], (["AS", "AH"], None))
         self.assertEqual(kwargs["hand_id"], 99)
 
+    def test_top_pair_plus_draw_folds_to_stack_pressure(self) -> None:
+        profile = analyze_postflop(["Ad", "9s"], ["Td", "8d", "Ah", "6d"])
+
+        headline, _reason, _target = _recommend_facing_postflop_bet(
+            profile,
+            0.856,
+            1616 / (1994 + 1616),
+            2,
+        )
+
+        self.assertEqual(headline, "ONE PAIR. FOLD TO STACK PRESSURE.")
+
+    def test_two_pair_folds_to_stack_pressure(self) -> None:
+        profile = analyze_postflop(["9c", "7c"], ["9d", "5s", "Jd", "7h"])
+
+        headline, _reason, _target = _recommend_facing_postflop_bet(
+            profile,
+            0.842,
+            1255 / (1494 + 1255),
+            2,
+        )
+
+        self.assertEqual(headline, "TWO PAIR. FOLD TO STACK PRESSURE.")
+
     def test_process_console_line_rejects_unlabelled_legacy_raw_state(self) -> None:
         app = object.__new__(PreflopApp)
         app.site_var = Mock()
@@ -1020,6 +1044,36 @@ class TrackerTests(unittest.TestCase):
 
         advice = app.strategy_advice_var.set.call_args.args[0]
         self.assertTrue(advice.startswith("PLAYABLE HAND. CALL OR RAISE SMALL."))
+
+    def test_score_55_speculative_hand_calls_unraised_blind_price(self) -> None:
+        app = self._strategy_app([Card("9", "c"), Card("7", "c")], to_call=4, pot=6, players=4)
+
+        PreflopApp._update_strategy_panel(app)
+
+        app.strategy_quick_var.set.assert_called_with("CALL")
+        advice = app.strategy_advice_var.set.call_args.args[0]
+        self.assertTrue(advice.startswith("SPECULATIVE HAND. CALL TO SEE FLOP."))
+
+    def test_score_55_speculative_hand_calls_unraised_small_blind_price(self) -> None:
+        app = self._strategy_app([Card("Q", "d"), Card("7", "c")], to_call=1, pot=3, players=4)
+        app._big_blind_chips = 2
+        app._hero_seat_id = 3
+        app._preflop_bets_by_seat = {3: 1, 4: 2}
+
+        PreflopApp._update_strategy_panel(app)
+
+        app.strategy_quick_var.set.assert_called_with("CALL")
+        advice = app.strategy_advice_var.set.call_args.args[0]
+        self.assertTrue(advice.startswith("SPECULATIVE HAND. CALL TO SEE FLOP."))
+
+    def test_score_55_speculative_hand_still_folds_to_raise_pressure(self) -> None:
+        app = self._strategy_app([Card("9", "c"), Card("7", "c")], to_call=10, pot=16, players=4)
+
+        PreflopApp._update_strategy_panel(app)
+
+        app.strategy_quick_var.set.assert_called_with("FOLD")
+        advice = app.strategy_advice_var.set.call_args.args[0]
+        self.assertTrue(advice.startswith("SPECULATIVE HAND. FOLD TO PRESSURE."))
 
     def test_strong_hand_raises_unopened_big_blind_price(self) -> None:
         app = self._strategy_app([Card("A", "s"), Card("K", "d")], to_call=4, pot=6, players=4)
