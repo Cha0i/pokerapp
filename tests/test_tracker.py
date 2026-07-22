@@ -1,4 +1,5 @@
 import unittest
+from concurrent.futures import Future
 from queue import Queue
 from unittest.mock import Mock
 
@@ -346,6 +347,7 @@ class TrackerTests(unittest.TestCase):
             hero_seat_id=2,
             pot_chips=25,
             to_call_chips=4,
+            big_blind_chips=4,
             minimum_raise_chips=8,
             hero_turn=True,
         )
@@ -353,6 +355,7 @@ class TrackerTests(unittest.TestCase):
         self.assertEqual(app._street, "flop")
         self.assertEqual(app._pot_chips, 25)
         self.assertEqual(app._to_call_chips, 4)
+        self.assertEqual(app._big_blind_chips, 4)
         self.assertEqual(app._minimum_raise_chips, 8)
         self.assertTrue(app._hero_turn)
         self.assertEqual(app.selected, [Card("K", "d"), Card("4", "d")])
@@ -366,6 +369,7 @@ class TrackerTests(unittest.TestCase):
             hero_seat_id=2,
             pot_chips=25,
             to_call_chips=4,
+            big_blind_chips=4,
             minimum_raise_chips=8,
             hero_turn=True,
         )
@@ -428,6 +432,7 @@ class TrackerTests(unittest.TestCase):
             hero_folded=False,
             pot_chips=6,
             to_call_chips=0,
+            big_blind_chips=None,
             minimum_raise_chips=None,
             hero_turn=False,
         )
@@ -458,6 +463,7 @@ class TrackerTests(unittest.TestCase):
             hero_folded=False,
             pot_chips=25,
             to_call_chips=None,
+            big_blind_chips=None,
             minimum_raise_chips=None,
             hero_turn=False,
         )
@@ -547,6 +553,7 @@ class TrackerTests(unittest.TestCase):
             hero_folded=False,
             pot_chips=6,
             to_call_chips=0,
+            big_blind_chips=None,
             minimum_raise_chips=None,
             hero_turn=False,
         )
@@ -669,6 +676,39 @@ class TrackerTests(unittest.TestCase):
 
         app.equity_var.set.assert_called_once_with("Equity: 45.0%")
         app._update_strategy_panel.assert_called_once_with()
+
+    def test_background_math_ignores_stale_odds_result(self) -> None:
+        app = object.__new__(PreflopApp)
+        app._math_results = Queue()
+        app._odds_task_id = 2
+        app._hand_rank_task_id = 0
+        app._odds_future = Mock()
+        app._apply_odds_result = Mock()
+        app._show_odds_error = Mock()
+
+        stale = Future()
+        stale.set_result((0.42, 0.03, 0.55))
+        app._math_results.put(("odds", 1, ("Kd", "4d", ("9s", "2d", "9h"), 3), stale))
+
+        self.assertEqual(PreflopApp._drain_math_results(app), 1)
+        app._apply_odds_result.assert_not_called()
+
+    def test_background_math_applies_current_odds_result(self) -> None:
+        app = object.__new__(PreflopApp)
+        key = ("Kd", "4d", ("9s", "2d", "9h"), 3)
+        app._math_results = Queue()
+        app._odds_task_id = 2
+        app._hand_rank_task_id = 0
+        app._odds_future = Mock()
+        app._apply_odds_result = Mock()
+        app._show_odds_error = Mock()
+
+        current = Future()
+        current.set_result((0.42, 0.03, 0.55))
+        app._math_results.put(("odds", 2, key, current))
+
+        self.assertEqual(PreflopApp._drain_math_results(app), 1)
+        app._apply_odds_result.assert_called_once_with(key, (0.42, 0.03, 0.55))
 
     def test_random_equity_does_not_turn_ace_high_into_a_call(self) -> None:
         profile = analyze_postflop(["Kd", "6d"], ["8h", "Ad", "5s"])
@@ -917,6 +957,15 @@ class TrackerTests(unittest.TestCase):
         app.strategy_quick_var.set.assert_called_with("WAIT")
         advice = app.strategy_advice_var.set.call_args.args[0]
         self.assertTrue(advice.startswith("WAIT FOR PREFLOP STATE."))
+
+    def test_preflop_with_bridge_blind_never_waits_on_a_real_call(self) -> None:
+        app = self._strategy_app([Card("8", "d"), Card("8", "c")], to_call=4, pot=6, players=4)
+        app._big_blind_chips = 4
+        app._minimum_raise_chips = 8
+
+        PreflopApp._update_strategy_panel(app)
+
+        self.assertNotEqual(app.strategy_quick_var.set.call_args.args[0], "WAIT")
 
     def test_unposted_preflop_hand_never_gets_a_free_check(self) -> None:
         app = self._strategy_app([Card("5", "s"), Card("2", "c")], to_call=2, pot=3, players=4)

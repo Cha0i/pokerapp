@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PokerOdds Tagged Bridge
 // @namespace    http://tampermonkey.net/
-// @version      2.9
+// @version      3.1
 // @description  Forward poker console messages to local PokerOdds bridge
 // @downloadURL  http://127.0.0.1:5000/tampermonkey-bridge.user.js
 // @updateURL    http://127.0.0.1:5000/tampermonkey-bridge.user.js
@@ -24,17 +24,21 @@
 (function () {
     'use strict';
 
-    var SCRIPT_VERSION = '2.9';
+    var SCRIPT_VERSION = '3.1';
     var BRIDGE_URLS = ['http://127.0.0.1:5000/log', 'http://localhost:5000/log'];
     var currentBridgeUrlIndex = 0;
     var BRIDGE_TAG = 'TM_BRIDGE:';
     var RAW_TAG = '[RAW_CONSOLE]';
     var DEFAULT_RELAX_HERO_NAME = 'xtlx';
-    var ENABLE_RAW_MIRROR = isDiscoveryHost();
+    // Full transport mirroring is useful only while diagnosing a new client.
+    // It is intentionally off during play: tournament traffic can delay cards.
+    var ENABLE_RAW_MIRROR = false;
+    var ENABLE_DISCOVERY_MIRROR = false;
     var ENABLE_STRATEGY_EVENT_MIRROR = true;
     var REHOOK_INTERVAL_MS = 1500;
     var lastSentKey = null;
     var HOOK_FLAG = '__tmPokerBridgeHooked__';
+    var pendingPriorityLines = [];
     var pendingLines = [];
     var flushTimer = null;
     var flushing = false;
@@ -113,7 +117,7 @@
     }
 
     function rawMirrorEnabled() {
-        return ENABLE_RAW_MIRROR || isDiscoveryHost();
+        return ENABLE_RAW_MIRROR;
     }
 
     function pageContext() {
@@ -153,6 +157,7 @@
         heroFolded: null,
         pot: null,
         toCall: null,
+        bigBlind: null,
         minimumRaise: null,
         heroTurn: null,
         resetSent: false
@@ -177,23 +182,36 @@
         }, delayMs);
     }
 
-    function enqueueLine(line) {
+    function queuedLineCount() {
+        return pendingPriorityLines.length + pendingLines.length;
+    }
+
+    function enqueueLine(line, priority) {
         if (!line) {
             return;
         }
-        pendingLines.push(line);
-        if (pendingLines.length > MAX_QUEUE_SIZE) {
-            pendingLines.splice(0, pendingLines.length - MAX_QUEUE_SIZE);
+        if (priority) {
+            pendingPriorityLines.push(line);
+        } else {
+            pendingLines.push(line);
+        }
+        while (queuedLineCount() > MAX_QUEUE_SIZE) {
+            if (pendingLines.length > 0) {
+                pendingLines.shift();
+            } else {
+                pendingPriorityLines.shift();
+            }
         }
         scheduleFlush(0);
     }
 
     function flushQueue() {
-        if (flushing || pendingLines.length === 0) {
+        if (flushing || queuedLineCount() === 0) {
             return;
         }
         flushing = true;
-        var line = pendingLines[0];
+        var queue = pendingPriorityLines.length > 0 ? pendingPriorityLines : pendingLines;
+        var line = queue[0];
         var url = currentBridgeUrl();
 
         GM_xmlhttpRequest({
@@ -208,9 +226,9 @@
                 flushing = false;
                 if (res.status === 200) {
                     reportTransportState('connected', 'connected to ' + url);
-                    pendingLines.shift();
+                    queue.shift();
                     retryDelayMs = 200;
-                    if (pendingLines.length > 0) {
+                    if (queuedLineCount() > 0) {
                         scheduleFlush(0);
                     }
                     return;
@@ -238,8 +256,8 @@
         });
     }
 
-    function sendLine(line) {
-        enqueueLine(line);
+    function sendLine(line, priority) {
+        enqueueLine(line, priority === true);
     }
 
     function sendRawLine(source, level, args) {
@@ -488,6 +506,9 @@
     }
 
     function sendDiscoveryLine(source, level, args) {
+        if (!ENABLE_DISCOVERY_MIRROR) {
+            return;
+        }
         var launcherLevel = level === 'IFRAME' || level === 'WINDOW_MESSAGE';
         if (!isDiscoveryHost() && !(launcherLevel && isUnibetLauncherPage())) {
             return;
@@ -514,7 +535,7 @@
             return;
         }
         lastSentKey = key;
-        sendLine(BRIDGE_TAG + key);
+        sendLine(BRIDGE_TAG + key, true);
     }
 
     function looksTaggedLine(value) {
@@ -660,6 +681,13 @@
         return 0;
     }
 
+    function relaxBigBlind(compactTable) {
+        if (!Array.isArray(compactTable) || typeof compactTable[15] !== 'number') {
+            return null;
+        }
+        return compactTable[15] > 0 ? Math.round(compactTable[15]) : null;
+    }
+
     function relaxPlayerNames(compactTable) {
         if (!Array.isArray(compactTable) || typeof compactTable[0] !== 'string') {
             return null;
@@ -712,6 +740,7 @@
         relaxHandState.heroFolded = null;
         relaxHandState.pot = null;
         relaxHandState.toCall = null;
+        relaxHandState.bigBlind = null;
         relaxHandState.minimumRaise = null;
         relaxHandState.heroTurn = null;
         relaxHandState.resetSent = false;
@@ -761,6 +790,10 @@
 
         var playerContext = Array.isArray(compactPayload.p) ? compactPayload.p : null;
         var compactTable = Array.isArray(compactPayload.c) ? compactPayload.c : null;
+        var bigBlind = relaxBigBlind(compactTable);
+        if (bigBlind !== null) {
+            relaxHandState.bigBlind = bigBlind;
+        }
         var playerSeatId = playerContext && typeof playerContext[1] === 'number' ? playerContext[1] : null;
         var namedHeroSeatId = relaxHeroSeatFromNames(compactTable);
         var heroSeatId = namedHeroSeatId !== null ? namedHeroSeatId : relaxHandState.heroSeatId;
@@ -902,6 +935,9 @@
         if (relaxHandState.heroTurn !== null && !Object.prototype.hasOwnProperty.call(payload, 'heroTurn')) {
             payload.heroTurn = relaxHandState.heroTurn;
         }
+        if (relaxHandState.bigBlind !== null) {
+            payload.bigBlind = relaxHandState.bigBlind;
+        }
         return payload;
     }
 
@@ -918,6 +954,10 @@
             }
             sendPayload(payload);
         }
+    }
+
+    function isRelaxPokerSocketUrl(url) {
+        return /\/wspoker(?:[/?#]|$)/i.test(String(url || ''));
     }
 
     function isPlayerActive(player) {
@@ -1677,7 +1717,9 @@
             }
             var details = socketDetails(socket);
             var data = event ? event.data : null;
-            processRelaxPokerFrame(data);
+            if (isRelaxPokerSocketUrl(details.url)) {
+                processRelaxPokerFrame(data);
+            }
             sendDiscoveryLine(sourceLabel, 'WS_MESSAGE', [
                 '#' + details.id,
                 details.url,
@@ -2021,19 +2063,27 @@
         } catch (_) {}
 
         try {
+            if (typeof unsafeWindow !== 'undefined' && unsafeWindow) {
+                installWebSocketDiscovery(unsafeWindow, 'unsafeWindow');
+            }
+        } catch (_) {}
+
+        try {
+            installWebSocketDiscovery(window, 'sandbox-window');
+        } catch (_) {}
+
+        if (!ENABLE_DISCOVERY_MIRROR) {
+            return;
+        }
+
+        try {
             installGlobalErrorCapture(window, 'sandbox-window');
         } catch (_) {}
 
         try {
             if (typeof unsafeWindow !== 'undefined' && unsafeWindow) {
                 installGlobalErrorCapture(unsafeWindow, 'unsafeWindow');
-            }
-        } catch (_) {}
-
-        try {
-            if (typeof unsafeWindow !== 'undefined' && unsafeWindow) {
                 installIframeDiscovery(unsafeWindow, 'unsafeWindow');
-                installWebSocketDiscovery(unsafeWindow, 'unsafeWindow');
                 installFetchDiscovery(unsafeWindow, 'unsafeWindow');
                 installXhrDiscovery(unsafeWindow, 'unsafeWindow');
                 installWorkerDiscovery(unsafeWindow, 'unsafeWindow');
@@ -2043,7 +2093,6 @@
 
         try {
             installIframeDiscovery(window, 'sandbox-window');
-            installWebSocketDiscovery(window, 'sandbox-window');
             installFetchDiscovery(window, 'sandbox-window');
             installXhrDiscovery(window, 'sandbox-window');
             installWorkerDiscovery(window, 'sandbox-window');

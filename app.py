@@ -11,6 +11,7 @@ import sys
 import traceback
 import tkinter as tk
 import tkinter.font as tkfont
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
@@ -275,10 +276,12 @@ BRIDGE_ALLOWED_ORIGINS = {
     for site in SUPPORTED_BRIDGE_SITES
     for origin in site.allowed_origins
 }
-BRIDGE_USERSCRIPT_VERSION = "2.9"
+BRIDGE_USERSCRIPT_VERSION = "3.1"
 BRIDGE_POLL_BATCH_SIZE = 32
-BRIDGE_POLL_IDLE_MS = 120
+BRIDGE_POLL_IDLE_MS = 25
 BRIDGE_POLL_BACKLOG_MS = 1
+ODDS_UPDATE_DELAY_MS = 60
+HAND_RANK_UPDATE_DELAY_MS = 180
 BRIDGE_LOG_DISPLAY_MAX_CHARS = 800
 BRIDGE_LOG_DISPLAY_MAX_LINES = 500
 LOW_VALUE_STRATEGY_ACTIONS = frozenset(
@@ -450,6 +453,12 @@ class PreflopApp(tk.Tk):
         self.player_tracker_recent_cards: list[tk.Label] = []
         self.odds_after_id: str | None = None
         self.hand_rank_after_id: str | None = None
+        self._math_results: Queue[tuple[str, int, object, Future[object]]] = Queue()
+        self._math_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pokerodds-math")
+        self._odds_task_id = 0
+        self._hand_rank_task_id = 0
+        self._odds_future: Future[object] | None = None
+        self._hand_rank_future: Future[object] | None = None
         self.odds_cache: dict[tuple[str, str, tuple[str, ...], int], tuple[float, float, float]] = {}
         self.hand_rank_cache: dict[tuple[str, str, tuple[str, ...]], tuple[dict[str, float], dict[str, float]]] = {}
         self._is_maximized = False
@@ -2267,10 +2276,62 @@ while ((Get-Date) -lt $deadline) {
 
     def _poll_server_queue(self) -> None:
         self._server_poll_job = None
+        self._drain_math_results()
         self._drain_server_queue_batch()
         if self.winfo_exists():
             delay_ms = BRIDGE_POLL_BACKLOG_MS if not self._incoming_logs.empty() else BRIDGE_POLL_IDLE_MS
             self._schedule_server_poll(delay_ms)
+
+    def _drain_math_results(self, limit: int = 4) -> int:
+        results = getattr(self, "_math_results", None)
+        if results is None:
+            return 0
+        processed = 0
+        while processed < limit:
+            try:
+                kind, task_id, key, future = results.get_nowait()
+            except Empty:
+                break
+            processed += 1
+            if kind == "odds":
+                if task_id != self._odds_task_id:
+                    continue
+                self._odds_future = None
+                try:
+                    result = future.result()
+                except CancelledError:
+                    continue
+                except ValueError as error:
+                    self._show_odds_error(error)
+                    continue
+                except Exception as error:
+                    self._append_server_log(f"[math] odds calculation failed: {error}")
+                    self._show_odds_error(error)
+                    continue
+                if not isinstance(result, tuple) or len(result) != 3:
+                    continue
+                self._apply_odds_result(key, result)
+                continue
+
+            if kind == "hand_rank":
+                if task_id != self._hand_rank_task_id:
+                    continue
+                self._hand_rank_future = None
+                try:
+                    result = future.result()
+                except CancelledError:
+                    continue
+                except ValueError as error:
+                    self._show_hand_rank_error(error)
+                    continue
+                except Exception as error:
+                    self._append_server_log(f"[math] hand-rank calculation failed: {error}")
+                    self._show_hand_rank_error(error)
+                    continue
+                if not isinstance(result, tuple) or len(result) != 2:
+                    continue
+                self._apply_hand_rank_result(key, result)
+        return processed
 
     def _extract_cards_from_text(self, text: str) -> list[str]:
         return [match.upper() for match in re.findall(r"\b([2-9TJQKA][CDHScdhs])\b", text)]
@@ -2351,9 +2412,7 @@ while ((Get-Date) -lt $deadline) {
             return None
         if len(compact_table) > 15 and isinstance(compact_table[15], int) and compact_table[15] > 0:
             return compact_table[15]
-        bets = compact_table[3] if len(compact_table) > 3 and isinstance(compact_table[3], list) else []
-        positive_bets = [bet for bet in bets if isinstance(bet, int) and bet > 0]
-        return max(positive_bets) if positive_bets else None
+        return None
 
     def _unibet_raw_player_names(self, compact_table: object) -> list[str] | None:
         if not isinstance(compact_table, list) or not compact_table or not isinstance(compact_table[0], str):
@@ -2533,6 +2592,7 @@ while ((Get-Date) -lt $deadline) {
         big_blind = self._unibet_raw_big_blind_amount(compact_table)
         if big_blind is not None:
             self._big_blind_chips = big_blind
+            payload["bigBlind"] = big_blind
         player_seat_id = (
             player_context[1]
             if isinstance(player_context, list) and len(player_context) > 1 and isinstance(player_context[1], int)
@@ -2668,6 +2728,7 @@ while ((Get-Date) -lt $deadline) {
                         hero_folded,
                         pot_chips,
                         to_call_chips,
+                        big_blind_chips,
                         minimum_raise_chips,
                         hero_turn,
                     ) = parsed
@@ -2684,6 +2745,7 @@ while ((Get-Date) -lt $deadline) {
                         hero_folded=hero_folded,
                         pot_chips=pot_chips,
                         to_call_chips=to_call_chips,
+                        big_blind_chips=big_blind_chips,
                         minimum_raise_chips=minimum_raise_chips,
                         hero_turn=hero_turn,
                     )
@@ -2695,7 +2757,7 @@ while ((Get-Date) -lt $deadline) {
     def _parse_tagged_bridge_payload(
         self,
         payload: object,
-    ) -> tuple[list[str], list[str] | None, int | None, bool, int | None, str | None, int | None, int | None, bool | None, bool | None, int | None, int | None, int | None, bool | None] | None:
+    ) -> tuple[list[str], list[str] | None, int | None, bool, int | None, str | None, int | None, int | None, bool | None, bool | None, int | None, int | None, int | None, int | None, bool | None] | None:
         parsed = parse_bridge_payload(payload)
         if parsed is None:
             return None
@@ -2712,6 +2774,7 @@ while ((Get-Date) -lt $deadline) {
             parsed.hero_folded,
             parsed.pot_chips,
             parsed.to_call_chips,
+            parsed.big_blind_chips,
             parsed.minimum_raise_chips,
             parsed.hero_turn,
         )
@@ -2882,6 +2945,7 @@ while ((Get-Date) -lt $deadline) {
             hero_folded,
             pot_chips,
             to_call_chips,
+            big_blind_chips,
             minimum_raise_chips,
             hero_turn,
         ) = parsed
@@ -2898,6 +2962,7 @@ while ((Get-Date) -lt $deadline) {
             hero_folded=hero_folded,
             pot_chips=pot_chips,
             to_call_chips=to_call_chips,
+            big_blind_chips=big_blind_chips,
             minimum_raise_chips=minimum_raise_chips,
             hero_turn=hero_turn,
         )
@@ -3736,6 +3801,7 @@ while ((Get-Date) -lt $deadline) {
         hero_folded: bool | None = None,
         pot_chips: int | None = None,
         to_call_chips: int | None = None,
+        big_blind_chips: int | None = None,
         minimum_raise_chips: int | None = None,
         hero_turn: bool | None = None,
     ) -> None:
@@ -3760,6 +3826,7 @@ while ((Get-Date) -lt $deadline) {
             hero_folded=hero_folded,
             pot_chips=pot_chips,
             to_call_chips=to_call_chips,
+            big_blind_chips=big_blind_chips,
             minimum_raise_chips=minimum_raise_chips,
             hero_turn=hero_turn,
         )
@@ -3836,6 +3903,8 @@ while ((Get-Date) -lt $deadline) {
             self._pot_chips = pot_chips
         if to_call_chips is not None:
             self._to_call_chips = to_call_chips
+        if big_blind_chips is not None:
+            self._big_blind_chips = big_blind_chips
         if minimum_raise_chips is not None:
             self._minimum_raise_chips = minimum_raise_chips
         if hero_turn is not None:
@@ -3969,6 +4038,15 @@ while ((Get-Date) -lt $deadline) {
         self._update_strategy_panel()
 
     def destroy(self) -> None:
+        self._odds_task_id += 1
+        self._hand_rank_task_id += 1
+        if self._odds_future is not None:
+            self._odds_future.cancel()
+            self._odds_future = None
+        if self._hand_rank_future is not None:
+            self._hand_rank_future.cancel()
+            self._hand_rank_future = None
+        self._math_executor.shutdown(wait=False, cancel_futures=True)
         if self._wslg_host_chrome_job is not None:
             try:
                 self.after_cancel(self._wslg_host_chrome_job)
@@ -4806,6 +4884,11 @@ while ((Get-Date) -lt $deadline) {
         if self.odds_after_id is not None:
             self.after_cancel(self.odds_after_id)
             self.odds_after_id = None
+        self._odds_task_id += 1
+        task_id = self._odds_task_id
+        if self._odds_future is not None:
+            self._odds_future.cancel()
+            self._odds_future = None
 
         self.odds_status_var.set(f"Odds vs {players - 1} random opponents (calculating...)")
         self.win_var.set("Win: ...")
@@ -4813,7 +4896,13 @@ while ((Get-Date) -lt $deadline) {
         self.loss_var.set("Loss: ...")
         self.equity_var.set("Equity: ...")
 
-        self.odds_after_id = self.after(120, lambda: self._run_odds_update(players, board_codes))
+        hero_cards = [self.selected[0].code, self.selected[1].code]
+        board_snapshot = list(board_codes)
+        key = (hero_cards[0], hero_cards[1], tuple(board_snapshot), players)
+        self.odds_after_id = self.after(
+            ODDS_UPDATE_DELAY_MS,
+            lambda: self._start_odds_update(task_id, key, hero_cards, board_snapshot, players),
+        )
 
     def _hand_rank_cache_key(self, board_codes: list[str]) -> tuple[str, str, tuple[str, ...]]:
         return (
@@ -4826,13 +4915,107 @@ while ((Get-Date) -lt $deadline) {
         if self.hand_rank_after_id is not None:
             self.after_cancel(self.hand_rank_after_id)
             self.hand_rank_after_id = None
+        self._hand_rank_task_id += 1
+        task_id = self._hand_rank_task_id
+        if self._hand_rank_future is not None:
+            self._hand_rank_future.cancel()
+            self._hand_rank_future = None
 
         self.hand_rank_status_var.set("Hand odds: calculating your final hand distribution...")
         for key, _label in HAND_CATEGORY_ORDER:
             self.hand_rank_you_vars[key].set("...")
             self.hand_rank_other_vars[key].set("...")
 
-        self.hand_rank_after_id = self.after(140, lambda: self._run_hand_rank_update(board_codes))
+        hero_cards = [self.selected[0].code, self.selected[1].code]
+        board_snapshot = list(board_codes)
+        key = (hero_cards[0], hero_cards[1], tuple(board_snapshot))
+        self.hand_rank_after_id = self.after(
+            HAND_RANK_UPDATE_DELAY_MS,
+            lambda: self._start_hand_rank_update(task_id, key, hero_cards, board_snapshot),
+        )
+
+    def _submit_math_task(
+        self,
+        kind: str,
+        task_id: int,
+        key: object,
+        function: object,
+        *args: object,
+    ) -> Future[object]:
+        future = self._math_executor.submit(function, *args)
+        results = self._math_results
+        future.add_done_callback(
+            lambda completed: results.put((kind, task_id, key, completed))
+        )
+        return future
+
+    def _start_odds_update(
+        self,
+        task_id: int,
+        key: tuple[str, str, tuple[str, ...], int],
+        hero_cards: list[str],
+        board_codes: list[str],
+        players: int,
+    ) -> None:
+        self.odds_after_id = None
+        if task_id != self._odds_task_id:
+            return
+        cached = self.odds_cache.get(key)
+        if cached is not None:
+            self._apply_odds_result(key, cached)
+            return
+        self._odds_future = self._submit_math_task(
+            "odds",
+            task_id,
+            key,
+            simulate_equity,
+            hero_cards,
+            board_codes,
+            players,
+            1200,
+        )
+
+    def _start_hand_rank_update(
+        self,
+        task_id: int,
+        key: tuple[str, str, tuple[str, ...]],
+        hero_cards: list[str],
+        board_codes: list[str],
+    ) -> None:
+        self.hand_rank_after_id = None
+        if task_id != self._hand_rank_task_id:
+            return
+        cached = self.hand_rank_cache.get(key)
+        if cached is not None:
+            self._apply_hand_rank_result(key, cached)
+            return
+        self._hand_rank_future = self._submit_math_task(
+            "hand_rank",
+            task_id,
+            key,
+            simulate_hand_rank_distribution,
+            hero_cards,
+            board_codes,
+            1800,
+        )
+
+    def _show_hand_rank_error(self, error: Exception) -> None:
+        self.hand_rank_status_var.set(f"Hand odds: {error}")
+        for rank_key, _label in HAND_CATEGORY_ORDER:
+            self.hand_rank_you_vars[rank_key].set("-")
+            self.hand_rank_other_vars[rank_key].set("-")
+
+    def _apply_hand_rank_result(
+        self,
+        key: tuple[str, str, tuple[str, ...]],
+        result: tuple[dict[str, float], dict[str, float]],
+    ) -> None:
+        hero_rates, other_rates = result
+        self.hand_rank_cache[key] = result
+        for rank_key, _label in HAND_CATEGORY_ORDER:
+            self.hand_rank_you_vars[rank_key].set(f"{hero_rates[rank_key] * 100:.2f}%")
+            self.hand_rank_other_vars[rank_key].set(f"{other_rates[rank_key] * 100:.2f}%")
+        self.hand_rank_status_var.set("You = your final hand by river. Others = one random opponent with the same exposed board information.")
 
     def _run_hand_rank_update(self, board_codes: list[str]) -> None:
         self.hand_rank_after_id = None
@@ -4847,18 +5030,36 @@ while ((Get-Date) -lt $deadline) {
                     simulations=1800,
                 )
             except ValueError as error:
-                self.hand_rank_status_var.set(f"Hand odds: {error}")
-                for rank_key, _label in HAND_CATEGORY_ORDER:
-                    self.hand_rank_you_vars[rank_key].set("-")
-                    self.hand_rank_other_vars[rank_key].set("-")
+                self._show_hand_rank_error(error)
                 return
-            self.hand_rank_cache[key] = (hero_rates, other_rates)
+        self._apply_hand_rank_result(key, (hero_rates, other_rates))
 
-        for rank_key, _label in HAND_CATEGORY_ORDER:
-            self.hand_rank_you_vars[rank_key].set(f"{hero_rates[rank_key] * 100:.2f}%")
-            self.hand_rank_other_vars[rank_key].set(f"{other_rates[rank_key] * 100:.2f}%")
+    def _show_odds_error(self, error: Exception) -> None:
+        self.odds_status_var.set(f"Odds: {error}")
+        self.win_var.set("Win: -")
+        self.tie_var.set("Tie: -")
+        self.loss_var.set("Loss: -")
+        self.equity_var.set("Equity: -")
+        if self.equity_label is not None:
+            self.equity_label.configure(fg=FG_MAIN)
+        self._update_strategy_panel()
 
-        self.hand_rank_status_var.set("You = your final hand by river. Others = one random opponent with the same exposed board information.")
+    def _apply_odds_result(
+        self,
+        key: tuple[str, str, tuple[str, ...], int],
+        result: tuple[float, float, float],
+    ) -> None:
+        win, tie, loss = result
+        self.odds_cache[key] = result
+        equity = win + tie
+        self.odds_status_var.set(f"Odds vs {key[3] - 1} random opponents")
+        self.win_var.set(f"Win: {win * 100:.1f}%")
+        self.tie_var.set(f"Tie: {tie * 100:.1f}%")
+        self.loss_var.set(f"Loss: {loss * 100:.1f}%")
+        self.equity_var.set(f"Equity: {equity * 100:.1f}%")
+        if self.equity_label is not None:
+            self.equity_label.configure(fg=self._score_color(int(equity * 100)))
+        self._update_strategy_panel()
 
     def _run_odds_update(self, players: int, board_codes: list[str]) -> None:
         self.odds_after_id = None
@@ -4874,26 +5075,9 @@ while ((Get-Date) -lt $deadline) {
                     simulations=1200,
                 )
             except ValueError as error:
-                self.odds_status_var.set(f"Odds: {error}")
-                self.win_var.set("Win: -")
-                self.tie_var.set("Tie: -")
-                self.loss_var.set("Loss: -")
-                self.equity_var.set("Equity: -")
-                if self.equity_label is not None:
-                    self.equity_label.configure(fg=FG_MAIN)
-                self._update_strategy_panel()
+                self._show_odds_error(error)
                 return
-            self.odds_cache[key] = (win, tie, loss)
-
-        equity = win + tie
-        self.odds_status_var.set(f"Odds vs {players - 1} random opponents")
-        self.win_var.set(f"Win: {win * 100:.1f}%")
-        self.tie_var.set(f"Tie: {tie * 100:.1f}%")
-        self.loss_var.set(f"Loss: {loss * 100:.1f}%")
-        self.equity_var.set(f"Equity: {equity * 100:.1f}%")
-        if self.equity_label is not None:
-            self.equity_label.configure(fg=self._score_color(int(equity * 100)))
-        self._update_strategy_panel()
+        self._apply_odds_result(key, (win, tie, loss))
 
     def _set_board_slot(self, slot: str, card: Card | None) -> None:
         self.board_cards[slot] = card
@@ -4916,9 +5100,17 @@ while ((Get-Date) -lt $deadline) {
             if self.odds_after_id is not None:
                 self.after_cancel(self.odds_after_id)
                 self.odds_after_id = None
+            self._odds_task_id += 1
+            if self._odds_future is not None:
+                self._odds_future.cancel()
+                self._odds_future = None
             if self.hand_rank_after_id is not None:
                 self.after_cancel(self.hand_rank_after_id)
                 self.hand_rank_after_id = None
+            self._hand_rank_task_id += 1
+            if self._hand_rank_future is not None:
+                self._hand_rank_future.cancel()
+                self._hand_rank_future = None
             self.combo_var.set("Hand: -")
             self.score_var.set("Score: -")
             self.tier_var.set("Tier: -")

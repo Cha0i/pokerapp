@@ -81,7 +81,7 @@ python app.py
 
 The userscript is currently scoped to `casino.org` and Unibet Netherlands pages. It keeps raw console mirroring off for casino.org and captures the Relax Gaming transport used by Unibet. During Unibet validation, `browser-console.log` includes iframe URLs, WebSocket messages, `fetch` summaries, and XHR summaries alongside decoded `TM_BRIDGE` payloads.
 
-For Unibet in Chrome, verify Tampermonkey shows userscript version `2.9`, close all existing Unibet and casino.org replay tabs, and reopen the poker client. Look for `[PokerOdds Bridge v2.9]` in DevTools Console. Version `2.9` runs inside the Relax Gaming poker-client iframe, including client URLs with a deployment-specific path prefix, captures its WebSocket traffic, and decodes the compact XMPP hand messages into normal `TM_BRIDGE` updates for hand ID, hero seat and hole cards, community cards, active-player count, pot size, call price, minimum raise, and hero-turn timing. Every tagged payload identifies its source site and bridge version; the desktop app accepts state only from the site selected in the GUI and clears old hand/table locks when that selection changes. Unlabelled legacy state is rejected rather than guessed, preventing an open casino.org replay tab from replacing a live Unibet hand. Casino.org event batches are walked event-by-event so a `startHand` reset and later `dealHoleCards` in the same browser message both reach the app, while non-poker heartbeat/chat traffic is filtered before it reaches the strategy parser. The desktop drains bridge traffic in bounded batches so a busy replay table cannot block the GUI between hands. Unibet updates repeat the known hole and community cards as a self-contained snapshot, allowing the desktop app to recover its card state after an app restart or a missed bridge request. Its WebSocket discovery hooks both the page realm and listener APIs so inbound frames are captured even when the game bypasses the wrapped constructor. XMPP authentication payloads and common credential fields are redacted before logging. Every discovery record includes its page and frame context. The outer Unibet page only performs iframe and cross-frame message discovery, avoiding unrelated account-response bodies. Keep exactly one copy of the userscript enabled in Tampermonkey. The app rejects legacy Unibet discovery lines that lack page context and reports the canonical installation URL in its bridge log. You can also open the Tampermonkey extension menu on the Unibet tab and click **Test PokerOdds bridge**; the app should receive a versioned `[BRIDGE_DEBUG] manual bridge test` line.
+For Unibet in Chrome, verify Tampermonkey shows userscript version `3.1`, close all existing Unibet and casino.org replay tabs, and reopen the poker client. Look for `[PokerOdds Bridge v3.1]` in DevTools Console. Version `3.1` runs inside the Relax Gaming poker-client iframe, including client URLs with a deployment-specific path prefix, captures only the poker WebSocket, and forwards compact card snapshots ahead of optional diagnostics. Full transport mirroring is disabled during play so tournament chatter cannot delay a decision. Every tagged payload identifies its source site and bridge version; the desktop app accepts state only from the site selected in the GUI and clears old hand/table locks when that selection changes. It includes Unibet's authoritative big-blind value with each snapshot, so a normal live preflop state is not held at `WAIT` merely because blind state is missing. Unlabelled legacy state is rejected rather than guessed, preventing an open casino.org replay tab from replacing a live Unibet hand. Casino.org event batches are walked event-by-event so a `startHand` reset and later `dealHoleCards` in the same browser message both reach the app, while non-poker heartbeat/chat traffic is filtered before it reaches the strategy parser. The desktop polls bridge traffic at low latency and calculates odds in the background so card application and immediate advice are not delayed by Monte Carlo work. Unibet updates repeat the known hole and community cards as a self-contained snapshot, allowing the desktop app to recover its card state after an app restart or a missed bridge request. Keep exactly one copy of the userscript enabled in Tampermonkey. The app rejects legacy Unibet discovery lines that lack page context and reports the canonical installation URL in its bridge log. You can also open the Tampermonkey extension menu on the Unibet tab and click **Test PokerOdds bridge**; the app should receive a versioned `[BRIDGE_DEBUG] manual bridge test` line.
 
 ### Adding More Sites
 
@@ -105,6 +105,7 @@ Supported fields:
 - `heroFolded`: boolean
 - `pot`: current total pot in table chips
 - `toCall`: current hero call price
+- `bigBlind`: authoritative current big blind when the poker client provides it
 - `minimumRaise`: minimum raise-to amount when available
 - `heroTurn`: boolean indicating whether action is currently on the hero
 
@@ -143,12 +144,12 @@ The strategy coach is a live heuristic, not a GTO solver. On Unibet it waits for
   - If the hero was dealt in, compare the Relax `deal` frame, the following `TM_BRIDGE` `hole` payload in `browser-console.log`, and the matching `hole_set` event in `strategy-training.log`.
 
 - casino.org replay stops after a fold
-  - Confirm the userscript is version 2.9. This version removes duplicate event noise, filters low-value page chatter, and emits every real card payload inside casino.org event batches.
+  - Confirm the userscript is version 3.1. This version removes duplicate event noise, filters low-value page chatter, and emits every real card payload inside casino.org event batches.
   - A `startHand` payload now clears the folded state immediately; a later hero-hole payload from the same batch or the next event resumes advice for the new hand.
 
 - Advice does not match current state
   - Compare event sequence in `app-actions.log` and `strategy-training.log`.
-  - Confirm the userscript is version 2.9, and that new advice records contain the correct street plus numeric `pot` and `to_call` values.
+  - Confirm the userscript is version 3.1, and that new advice records contain the correct street plus numeric `pot` and `to_call` values.
 
 ## Development Check
 

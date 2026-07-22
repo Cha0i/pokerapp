@@ -20,6 +20,7 @@ class BridgePayloadTests(unittest.TestCase):
                 "heroFolded": False,
                 "pot": 24,
                 "toCall": 6,
+                "bigBlind": 4,
                 "minimumRaise": 12,
                 "heroTurn": True,
             }
@@ -39,6 +40,7 @@ class BridgePayloadTests(unittest.TestCase):
         self.assertFalse(parsed.hero_folded)
         self.assertEqual(parsed.pot_chips, 24)
         self.assertEqual(parsed.to_call_chips, 6)
+        self.assertEqual(parsed.big_blind_chips, 4)
         self.assertEqual(parsed.minimum_raise_chips, 12)
         self.assertTrue(parsed.hero_turn)
 

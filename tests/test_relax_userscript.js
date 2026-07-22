@@ -68,7 +68,13 @@ source = source.replace(
     '        strategyEventsFromArgs: strategyEventsFromArgs,\n' +
     '        currentSiteKey: currentSiteKey,\n' +
     '        isDiscoveryHost: isDiscoveryHost,\n' +
-    '        isUnibetLauncherPage: isUnibetLauncherPage\n' +
+    '        isUnibetLauncherPage: isUnibetLauncherPage,\n' +
+    '        isRelaxPokerSocketUrl: isRelaxPokerSocketUrl,\n' +
+    '        rawMirrorEnabled: rawMirrorEnabled,\n' +
+    '        sendPayload: sendPayload,\n' +
+    '        queuedLineCounts: function () {\n' +
+    '            return { priority: pendingPriorityLines.length, normal: pendingLines.length };\n' +
+    '        }\n' +
     '    };\n\n' +
     '    // Public helper for console/manual automation.'
 );
@@ -84,18 +90,28 @@ const strategyEventsFromArgs = context.__relaxParserTestApi.strategyEventsFromAr
 const currentSiteKey = context.__relaxParserTestApi.currentSiteKey;
 const isDiscoveryHost = context.__relaxParserTestApi.isDiscoveryHost;
 const isUnibetLauncherPage = context.__relaxParserTestApi.isUnibetLauncherPage;
-const tableWithNames = (names, states, board = null, bets = [0, 0, 0, 0, 0, 0], pots = []) => [
-    names,
-    states,
-    [100, 100, 100, 100, 100, 100],
-    bets,
-    pots,
-    null,
-    null,
-    board
-];
-const table = (states, board = null, bets = [0, 0, 0, 0, 0, 0], pots = []) => (
-    tableWithNames('p0|p1|xtlx|p3|p4|p5', states, board, bets, pots)
+const isRelaxPokerSocketUrl = context.__relaxParserTestApi.isRelaxPokerSocketUrl;
+const rawMirrorEnabled = context.__relaxParserTestApi.rawMirrorEnabled;
+const sendPayload = context.__relaxParserTestApi.sendPayload;
+const queuedLineCounts = context.__relaxParserTestApi.queuedLineCounts;
+const tableWithNames = (names, states, board = null, bets = [0, 0, 0, 0, 0, 0], pots = [], bigBlind = null) => {
+    const compactTable = [
+        names,
+        states,
+        [100, 100, 100, 100, 100, 100],
+        bets,
+        pots,
+        null,
+        null,
+        board
+    ];
+    if (typeof bigBlind === 'number') {
+        compactTable[15] = bigBlind;
+    }
+    return compactTable;
+};
+const table = (states, board = null, bets = [0, 0, 0, 0, 0, 0], pots = [], bigBlind = null) => (
+    tableWithNames('p0|p1|xtlx|p3|p4|p5', states, board, bets, pots, bigBlind)
 );
 const playerAt = (seat, hole) => ['table-instance', seat, 0, hole, null, null];
 const player = (hole) => playerAt(2, hole);
@@ -108,8 +124,17 @@ assert.equal(
 assert.deepEqual(JSON.parse(JSON.stringify(withBridgeContext({ type: 'poker_cards' }))), {
     type: 'poker_cards',
     site: 'unknown',
-    bridgeVersion: '2.9'
+    bridgeVersion: '3.1'
 });
+
+assert.equal(rawMirrorEnabled(), false);
+assert.equal(isRelaxPokerSocketUrl('wss://mclient.api.relaxg.com/wspoker/'), true);
+assert.equal(isRelaxPokerSocketUrl('wss://d3nb9o6fmxqr6n.cloudfront.net/wstourmon/'), false);
+const queueBeforePayload = queuedLineCounts();
+sendPayload({ type: 'poker_cards', hole: ['As', 'Kh'] });
+const queueAfterPayload = queuedLineCounts();
+assert.equal(queueAfterPayload.priority, queueBeforePayload.priority + 1);
+assert.equal(queueAfterPayload.normal, queueBeforePayload.normal);
 
 windowValue.location.hostname = 'www.unibet.nl';
 windowValue.location.pathname = '/play/pokerwebclient';
@@ -258,7 +283,7 @@ const heroDecision = parse({
     payLoad: {
         hid: 43,
         tid: 9001,
-        c: table([1, 1, 1, 1, 1, 1], null, [0, 2, 4, 0, 4, 8]),
+        c: table([1, 1, 1, 1, 1, 1], null, [0, 2, 4, 0, 4, 8], [], 4),
         d: [2, 15, 0, [[0, 0], [2, 4], [3, 8, 96, [8, 12, 16, 20]]]],
         p: player('kd4d')
     }
@@ -271,6 +296,7 @@ assert.deepEqual(JSON.parse(JSON.stringify(heroDecision)), {
     heroTurn: true,
     pot: 18,
     toCall: 4,
+    bigBlind: 4,
     minimumRaise: 8,
     hole: ['Kd', '4d'],
     board: [],
@@ -298,7 +324,8 @@ assert.deepEqual(JSON.parse(JSON.stringify(flop)), {
     heroFolded: false,
     heroTurn: false,
     pot: 25,
-    toCall: 0
+    toCall: 0,
+    bigBlind: 4
 });
 
 const folded = parse({

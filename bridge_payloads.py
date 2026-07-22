@@ -18,6 +18,7 @@ class BridgePayload:
     hero_folded: bool | None
     pot_chips: int | None
     to_call_chips: int | None
+    big_blind_chips: int | None
     minimum_raise_chips: int | None
     hero_turn: bool | None
 
@@ -81,6 +82,7 @@ def parse_bridge_payload(payload: object) -> BridgePayload | None:
     has_hero_folded = "heroFolded" in payload or "hero_folded" in payload
     has_pot = "pot" in payload or "pot_chips" in payload
     has_to_call = "toCall" in payload or "to_call" in payload
+    has_big_blind = "bigBlind" in payload or "big_blind" in payload
     has_minimum_raise = "minimumRaise" in payload or "minimum_raise" in payload
     has_hero_turn = "heroTurn" in payload or "hero_turn" in payload
     if not any(
@@ -97,6 +99,7 @@ def parse_bridge_payload(payload: object) -> BridgePayload | None:
             has_hero_folded,
             has_pot,
             has_to_call,
+            has_big_blind,
             has_minimum_raise,
             has_hero_turn,
         )
@@ -150,6 +153,8 @@ def parse_bridge_payload(payload: object) -> BridgePayload | None:
     pot_chips = pot_raw if isinstance(pot_raw, int) and pot_raw >= 0 else None
     to_call_raw = payload.get("toCall", payload.get("to_call"))
     to_call_chips = to_call_raw if isinstance(to_call_raw, int) and to_call_raw >= 0 else None
+    big_blind_raw = payload.get("bigBlind", payload.get("big_blind"))
+    big_blind_chips = big_blind_raw if isinstance(big_blind_raw, int) and big_blind_raw > 0 else None
     minimum_raise_raw = payload.get("minimumRaise", payload.get("minimum_raise"))
     minimum_raise_chips = (
         minimum_raise_raw
@@ -172,6 +177,7 @@ def parse_bridge_payload(payload: object) -> BridgePayload | None:
         hero_folded=hero_folded,
         pot_chips=pot_chips,
         to_call_chips=to_call_chips,
+        big_blind_chips=big_blind_chips,
         minimum_raise_chips=minimum_raise_chips,
         hero_turn=hero_turn,
     )
